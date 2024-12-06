@@ -55,6 +55,8 @@ from ray.util.queue import Queue
 
 from ax.service.ax_client import AxClient
 
+from Rewriter import VerilogRewriter
+
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 FASTROUTE_TCL = "fastroute.tcl"
@@ -406,6 +408,8 @@ def parse_config(config, path=os.getcwd()):
     options = ""
     sdc = {}
     fast_route = {}
+    params = {}
+    defines = {}
     flow_variables = parse_flow_variables()
     for key, value in config.items():
         # Keys that begin with underscore need special handling.
@@ -416,6 +420,10 @@ def parse_config(config, path=os.getcwd()):
             # Variables to be injected into constraints.sdc
             elif key.startswith("_SDC_"):
                 sdc[key.replace("_SDC_", "", 1)] = value
+            elif key.startswith("_PARAM_"):
+                params[key.replace("_PARAM_", "", 1)] = value
+            elif key.startswith("_DEF_"):
+                defines[key.replace("_DEF_", "", 1)] = value
             # Special substitution cases
             elif key == "_PINS_DISTANCE":
                 options += f' PLACE_PINS_ARGS="-min_distance {value}"'
@@ -440,6 +448,8 @@ def parse_config(config, path=os.getcwd()):
     if bool(fast_route):
         write_fast_route(fast_route, path)
         options += f" FASTROUTE_TCL={path}/{FASTROUTE_TCL}"
+    if bool(params) or bool(defines):
+        verilog_rewriter.update_sv(defines, params)
     return options
 
 
@@ -672,6 +682,13 @@ def parse_arguments():
         metavar="<sky130hd,sky130hs,asap7,...>",
         required=True,
         help="Name of the platform for Autotuning.",
+    )
+    parser.add_argument(
+        "--top_fn",
+        type=str,
+        metavar="<path>",
+        required=True,
+        help="Filename of the top-level module in which parameters and defines are set.",
     )
 
     # Experiment Setup
@@ -1012,6 +1029,8 @@ def sweep():
 
 if __name__ == "__main__":
     args = parse_arguments()
+    cur_path = os.path.dirname(os.path.realpath(__file__))
+    verilog_rewriter = VerilogRewriter(os.path.join(cur_path, f"../../../../flow/designs/src/{args.design}/{args.top_fn}"))
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
@@ -1083,9 +1102,12 @@ if __name__ == "__main__":
         _ = ray.get(task_id)
         print(f"[INFO TUN-0002] Best parameters found: {analysis.best_config}")
 
+        verilog_rewriter.reset_sv()
+
         # if all runs have failed
         if analysis.best_result["minimum"] == ERROR_METRIC:
             print("[ERROR TUN-0016] No successful runs found.")
             sys.exit(1)
+
     elif args.mode == "sweep":
         sweep()
