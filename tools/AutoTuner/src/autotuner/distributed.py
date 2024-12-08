@@ -6,12 +6,12 @@ For both sweep and tune modes:
     python3 distributed.py -h
 
 Note: the order of the parameters matter.
-Arguments --design, --platform and --config are always required and should
+Arguments --design, --platform, --config, --top_fn, --stage_stop are always required and should
 precede the <mode>.
 
 AutoTuner:
     python3 distributed.py tune -h
-    python3 distributed.py --design gcd --platform sky130hd \
+    python3 distributed.py --design gcd --platform sky130hd --top_fn gcd.v --stage_stop all \
                            --config ../designs/sky130hd/gcd/autotuner.json \
                            tune
     Example:
@@ -19,7 +19,7 @@ AutoTuner:
 Parameter sweeping:
     python3 distributed.py sweep -h
     Example:
-    python3 distributed.py --design gcd --platform sky130hd \
+    python3 distributed.py --design gcd --platform sky130hd --top_fn gcd.v --stage_stop all \
                            --config distributed-sweep-example.json \
                            sweep
 """
@@ -57,6 +57,7 @@ from ax.service.ax_client import AxClient
 
 from Rewriter import VerilogRewriter
 
+coeff_perform, coeff_power, coeff_area = 10000, 100, 100
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 FASTROUTE_TCL = "fastroute.tcl"
@@ -66,8 +67,43 @@ ERROR_METRIC = 9e99
 ORFS_FLOW_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../../../flow")
 )
+ALLOWED_STAGES = ["floorplan", "place", "cts", "route", "all"]
+METRICS_MAP = {
+    "floorplan": {  "total_power"   : ["floorplan", "power__total"],
+                    "core_util"     : ["floorplan", "design__instance__utilization"],
+                    "worst_slack"   : ["floorplan", "timing__setup__ws"]},
+    
+    "place": {      "total_power"   : ["detailedplace","power__total"],
+                    "wirelength"    : ["detailedplace","route__wirelength__estimated"],
+                    "core_util"     : ["detailedplace", "design__instance__utilization"],
+                    "worst_slack"   : ["detailedplace", "timing__setup__ws"]},
+    
+    "cts": {        "total_power"   : ["cts","power__total"],
+                    "wirelength"    : ["cts","route__wirelength__estimated"],
+                    "core_util"     : ["cts", "design__instance__utilization"],
+                    "worst_slack"   : ["cts", "timing__setup__ws"]},
+    
+    "route": {      "total_power"   : ["globalroute","power__total"],
+                    "wirelength"    : ["detailedroute","route__wirelength"],
+                    "core_util"     : ["globalroute", "design__instance__utilization"],
+                    "num_drc"       : ["detailedroute","route__drc_errors"],
+                    "worst_slack"   : ["globalroute", "timing__setup__ws"]},
+    
+    "all": {        "total_power"   : ["finish", "power__total"],
+                    "wirelength"    : ["detailedroute","route__wirelength"],
+                    "core_util"     : ["globalroute", "design__instance__utilization"],
+                    "final_util"    : ["finish", "design__instance__utilization"],
+                    "num_drc"       : ["detailedroute","route__drc_errors"],
+                    "worst_slack"   : ["finish", "timing__setup__ws"]}
+}
 
+from enum import Enum
+# ----- ENUMS ----- #
+class TerminalTool(Enum):
+    warning = "\033[93mWARNING\033[0m"
+    error = "\033[91mERROR\033[0m"
 
+# ----- CLASSES ----- #
 class AutoTunerBase(tune.Trainable):
     """
     AutoTuner base class for experiments.
@@ -103,13 +139,16 @@ class AutoTunerBase(tune.Trainable):
         It can change in any form to minimize the score (return value).
         Default evaluation function optimizes effective clock period.
         """
-        error = "ERR" in metrics.values()
-        not_found = "N/A" in metrics.values()
-        if error or not_found:
+
+        if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
             return ERROR_METRIC
+
         gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
         score = metrics["clk_period"] - metrics["worst_slack"]
-        score = score * (self.step_ / 100) ** (-1) + gamma * metrics["num_drc"]
+        score = score * (self.step_ / 100) ** (-1)
+
+        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+            score += gamma * metrics["num_drc"]
         return score
 
     @classmethod
@@ -119,38 +158,27 @@ class AutoTunerBase(tune.Trainable):
         """
         with open(file_name) as file:
             data = json.load(file)
-        clk_period = 9999999
-        worst_slack = "ERR"
-        wirelength = "ERR"
-        num_drc = "ERR"
-        total_power = "ERR"
-        core_util = "ERR"
-        final_util = "ERR"
-        for stage, value in data.items():
-            if stage == "constraints" and len(value["clocks__details"]) > 0:
-                clk_period = float(value["clocks__details"][0].split()[1])
-            if stage == "floorplan" and "design__instance__utilization" in value:
-                core_util = value["design__instance__utilization"]
-            if stage == "detailedroute" and "route__drc_errors" in value:
-                num_drc = value["route__drc_errors"]
-            if stage == "detailedroute" and "route__wirelength" in value:
-                wirelength = value["route__wirelength"]
-            if stage == "finish" and "timing__setup__ws" in value:
-                worst_slack = value["timing__setup__ws"]
-            if stage == "finish" and "power__total" in value:
-                total_power = value["power__total"]
-            if stage == "finish" and "design__instance__utilization" in value:
-                final_util = value["design__instance__utilization"]
-        ret = {
-            "clk_period": clk_period,
-            "worst_slack": worst_slack,
-            "wirelength": wirelength,
-            "num_drc": num_drc,
-            "total_power": total_power,
-            "core_util": core_util,
-            "final_util": final_util,
+
+        metrics_dict = {
+            "clk_period": 9999999,
+            "worst_slack": "N/A",
+            "wirelength": "N/A",
+            "num_drc": "N/A",
+            "total_power": "N/A",
+            "core_util": "N/A",
+            "final_util": "N/A",
         }
-        return ret
+
+        if len(data["constraints"]["clocks__details"]) > 0:
+            metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
+
+        for metric_name in metrics_dict.keys():
+            if metric_name in METRICS_MAP[args.stage_stop].keys():
+                stage_name = METRICS_MAP[args.stage_stop][metric_name][0]
+                metric_json_name = METRICS_MAP[args.stage_stop][metric_name][1]
+                metrics_dict[metric_name] = data[stage_name][metric_json_name]
+
+        return metrics_dict
 
 
 class PPAImprov(AutoTunerBase):
@@ -163,7 +191,8 @@ class PPAImprov(AutoTunerBase):
         """
         Compute PPA term for evaluate.
         """
-        coeff_perform, coeff_power, coeff_area = 10000, 100, 100
+
+        # TODO: Fix this to work with all stages
 
         eff_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
@@ -190,9 +219,6 @@ class PPAImprov(AutoTunerBase):
     def evaluate(self, metrics):
         error = "ERR" in metrics.values() or "ERR" in reference.values()
         not_found = "N/A" in metrics.values() or "N/A" in reference.values()
-        print("Metrics", metrics.values())
-        print("Reference", reference.values())
-        print(error, not_found)
         if error or not_found:
             return ERROR_METRIC
         ppa = self.get_ppa(metrics)
@@ -578,7 +604,11 @@ def openroad(base_dir, parameters, flow_variant, path=""):
     export_command += " && "
 
     make_command = export_command
-    make_command += f"make -C {base_dir}/flow DESIGN_CONFIG=designs/"
+    make_command += f"make"
+    if args.stage_stop != "all":
+        for i in range (ALLOWED_STAGES.index(args.stage_stop) + 1):
+            make_command += f" {ALLOWED_STAGES[i]}" # Append preceding flow stages to make command
+    make_command += f" -C {base_dir}/flow DESIGN_CONFIG=designs/"
     make_command += f"{args.platform}/{args.design}/config.mk"
     make_command += f" PLATFORM={args.platform}"
     make_command += f" FLOW_VARIANT={flow_variant} {parameters}"
@@ -869,6 +899,15 @@ def parse_arguments():
         " training stderr\n\t2: also print training stdout.",
     )
 
+    parser.add_argument(
+        "--stage_stop",
+        type=str,
+        metavar="<all, floorplan, place, cts, route...>",
+        default="all",
+        help="Stage at wchich to stop the flow and use for metrics.",
+        choices=ALLOWED_STAGES
+    )
+
     arguments = parser.parse_args()
     if arguments.mode == "tune":
         arguments.algorithm = arguments.algorithm.lower()
@@ -884,6 +923,10 @@ def parse_arguments():
 
     if arguments.timeout is not None:
         arguments.timeout = round(arguments.timeout * 3600)
+
+    # TODO: Remove once fixed
+    if (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
+        print(f"{TerminalTool.warning.value}: Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
 
     return arguments
 
@@ -975,6 +1018,9 @@ def save_best(results):
     """
     best_config = results.best_config
     best_config["best_result"] = results.best_result[METRIC]
+    best_config["coeff_perform"] = coeff_perform
+    best_config["coeff_area"] = coeff_area
+    best_config["coeff_power"] = coeff_power
     trial_id = results.best_trial.trial_id
     new_best_path = f"{LOCAL_DIR}/{args.experiment}/"
     new_best_path += f"autotuner-best-{trial_id}.json"
@@ -1064,7 +1110,7 @@ if __name__ == "__main__":
         os.chdir(ORFS_FLOW_DIR)
         LOCAL_DIR = f"logs/{args.platform}/{args.design}"
         LOCAL_DIR = os.path.abspath(LOCAL_DIR)
-        INSTALL_PATH = os.path.abspath("../tools/install")
+        INSTALL_PATH = os.path.abspath("/foss/tools")
 
     if args.mode == "tune":
         best_params = set_best_params(args.platform, args.design)
@@ -1108,6 +1154,5 @@ if __name__ == "__main__":
         if analysis.best_result["minimum"] == ERROR_METRIC:
             print("[ERROR TUN-0016] No successful runs found.")
             sys.exit(1)
-
     elif args.mode == "sweep":
         sweep()

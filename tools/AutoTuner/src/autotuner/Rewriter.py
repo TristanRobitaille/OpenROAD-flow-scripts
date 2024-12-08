@@ -17,7 +17,7 @@ class VerilogRewriter():
     def __init__(self, sv_fp:str):
         self.sv_fp = Path(sv_fp)
         self.char_offset_from_insertion = 0
-        self.backup_path = self.sv_fp.with_name(f"{self.sv_fp.stem}_ref{self.sv_fp.suffix}")
+        self.backup_path = self.sv_fp.with_name(f"{self.sv_fp.stem}_ref{self.sv_fp.suffix}.temp")
         copy2(self.sv_fp, self.backup_path)
 
     def _replace_in_file(self, start_pos:int, end_pos:int, new_text:str) -> int:
