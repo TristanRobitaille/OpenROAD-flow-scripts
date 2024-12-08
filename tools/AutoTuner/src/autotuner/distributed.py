@@ -57,7 +57,6 @@ from ax.service.ax_client import AxClient
 
 from Rewriter import VerilogRewriter
 
-coeff_perform, coeff_power, coeff_area = 10000, 100, 100
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 FASTROUTE_TCL = "fastroute.tcl"
@@ -92,10 +91,11 @@ METRICS_MAP = {
     "all": {        "total_power"   : ["finish", "power__total"],
                     "wirelength"    : ["detailedroute","route__wirelength"],
                     "core_util"     : ["globalroute", "design__instance__utilization"],
-                    "final_util"    : ["finish", "design__instance__utilization"],
                     "num_drc"       : ["detailedroute","route__drc_errors"],
                     "worst_slack"   : ["finish", "timing__setup__ws"]}
 }
+
+COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 10000, 100, 100
 
 from enum import Enum
 # ----- ENUMS ----- #
@@ -166,7 +166,6 @@ class AutoTunerBase(tune.Trainable):
             "num_drc": "N/A",
             "total_power": "N/A",
             "core_util": "N/A",
-            "final_util": "N/A",
         }
 
         if len(data["constraints"]["clocks__details"]) > 0:
@@ -191,8 +190,9 @@ class PPAImprov(AutoTunerBase):
         """
         Compute PPA term for evaluate.
         """
-
-        # TODO: Fix this to work with all stages
+        assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
+        assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
+        assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
 
         eff_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
@@ -207,23 +207,27 @@ class PPAImprov(AutoTunerBase):
 
         performance = percent(eff_clk_period_ref, eff_clk_period)
         power = percent(reference["total_power"], metrics["total_power"])
-        area = percent(100 - reference["final_util"], 100 - metrics["final_util"])
+        area = percent(100 - reference["core_util"], 100 - metrics["core_util"])
 
         # Lower values of PPA are better.
-        ppa_upper_bound = (coeff_perform + coeff_power + coeff_area) * 100
-        ppa = performance * coeff_perform
-        ppa += power * coeff_power
-        ppa += area * coeff_area
+        ppa_upper_bound = (COEFF_PERFORM + COEFF_POWER + COEFF_AREA) * 100
+        ppa = performance * COEFF_PERFORM
+        ppa += power * COEFF_POWER
+        ppa += area * COEFF_AREA
         return ppa_upper_bound - ppa
 
     def evaluate(self, metrics):
-        error = "ERR" in metrics.values() or "ERR" in reference.values()
-        not_found = "N/A" in metrics.values() or "N/A" in reference.values()
-        if error or not_found:
-            return ERROR_METRIC
-        ppa = self.get_ppa(metrics)
-        gamma = ppa / 10
-        score = ppa * (self.step_ / 100) ** (-1) + (gamma * metrics["num_drc"])
+        expected_metrics = METRICS_MAP[args.stage_stop].keys()
+        for metric in expected_metrics:
+            if metrics[metric] == "N/A" or reference[metric] == "N/A":
+                return ERROR_METRIC
+       
+        ppa = self.get_ppa(metrics)        
+        score = ppa * (self.step_ / 100) ** (-1)
+        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+            gamma = ppa / 10
+            score += gamma * metrics["num_drc"]
+
         return score
 
 
@@ -753,14 +757,14 @@ def parse_arguments():
         "--git_clean",
         action="store_true",
         help="Clean binaries and build files."
-        " WARNING: may lose previous data."
+        f"WARNING: may lose previous data."
         " Use carefully.",
     )
     parser.add_argument(
         "--git_clone",
         action="store_true",
         help="Force new git clone."
-        " WARNING: may lose previous data."
+        f"WARNING: may lose previous data."
         " Use carefully.",
     )
     parser.add_argument(
@@ -926,7 +930,7 @@ def parse_arguments():
 
     # TODO: Remove once fixed
     if (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
-        print(f"{TerminalTool.warning.value}: Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
+        print(f"Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
 
     return arguments
 
@@ -938,7 +942,7 @@ def set_algorithm(experiment_name, config):
     # Pre-set seed if user sets seed to 0
     if args.seed == 0:
         print(
-            "Warning: you have chosen not to set a seed. Do you wish to continue? (y/n)"
+            f"Warning: you have chosen not to set a seed. Do you wish to continue? (y/n)"
         )
         if input().lower() != "y":
             sys.exit(0)
@@ -1018,9 +1022,9 @@ def save_best(results):
     """
     best_config = results.best_config
     best_config["best_result"] = results.best_result[METRIC]
-    best_config["coeff_perform"] = coeff_perform
-    best_config["coeff_area"] = coeff_area
-    best_config["coeff_power"] = coeff_power
+    best_config["coeff_perform"] = COEFF_PERFORM
+    best_config["coeff_area"] = COEFF_AREA
+    best_config["coeff_power"] = COEFF_POWER
     trial_id = results.best_trial.trial_id
     new_best_path = f"{LOCAL_DIR}/{args.experiment}/"
     new_best_path += f"autotuner-best-{trial_id}.json"
@@ -1057,7 +1061,7 @@ def sweep():
             print(f"[ERROR TUN-0015] {name} sweep is not supported.")
             sys.exit(1)
         if content[-1] == 0:
-            print("[ERROR TUN-0014] Sweep does not support step value zero.")
+            print(f"[ERROR TUN-0014] Sweep does not support step value zero.")
             sys.exit(1)
         parameter_list.append([{name: i} for i in np.arange(*content)])
     parameter_list = list(product(*parameter_list))
@@ -1152,7 +1156,7 @@ if __name__ == "__main__":
 
         # if all runs have failed
         if analysis.best_result["minimum"] == ERROR_METRIC:
-            print("[ERROR TUN-0016] No successful runs found.")
+            print(f"[ERROR TUN-0016] No successful runs found.")
             sys.exit(1)
     elif args.mode == "sweep":
         sweep()
