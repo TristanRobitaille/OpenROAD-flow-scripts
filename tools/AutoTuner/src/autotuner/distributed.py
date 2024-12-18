@@ -6,12 +6,12 @@ For both sweep and tune modes:
     python3 distributed.py -h
 
 Note: the order of the parameters matter.
-Arguments --design, --platform, --config, --top_fn, --stage_stop are always required and should
+Arguments --design, --platform, --config, --stage_stop are always required and should
 precede the <mode>.
 
 AutoTuner:
     python3 distributed.py tune -h
-    python3 distributed.py --design gcd --platform sky130hd --top_fn gcd.v --stage_stop all \
+    python3 distributed.py --design gcd --platform sky130hd --stage_stop all \
                            --config ../designs/sky130hd/gcd/autotuner.json \
                            tune
     Example:
@@ -19,7 +19,7 @@ AutoTuner:
 Parameter sweeping:
     python3 distributed.py sweep -h
     Example:
-    python3 distributed.py --design gcd --platform sky130hd --top_fn gcd.v --stage_stop all \
+    python3 distributed.py --design gcd --platform sky130hd --stage_stop all \
                            --config distributed-sweep-example.json \
                            sweep
 """
@@ -72,13 +72,13 @@ METRICS_MAP = {
                     "core_util"     : ["floorplan", "design__instance__utilization"],
                     "worst_slack"   : ["floorplan", "timing__setup__ws"]},
     
-    "place": {      "total_power"   : ["detailedplace","power__total"],
-                    "wirelength"    : ["detailedplace","route__wirelength__estimated"],
+    "place": {      "total_power"   : ["detailedplace", "power__total"],
+                    "wirelength"    : ["detailedplace", "route__wirelength__estimated"],
                     "core_util"     : ["detailedplace", "design__instance__utilization"],
                     "worst_slack"   : ["detailedplace", "timing__setup__ws"]},
     
-    "cts": {        "total_power"   : ["cts","power__total"],
-                    "wirelength"    : ["cts","route__wirelength__estimated"],
+    "cts": {        "total_power"   : ["cts", "power__total"],
+                    "wirelength"    : ["cts", "route__wirelength__estimated"],
                     "core_util"     : ["cts", "design__instance__utilization"],
                     "worst_slack"   : ["cts", "timing__setup__ws"]},
     
@@ -350,6 +350,7 @@ def read_config(file_name):
         raise ValueError(f"Invalid JSON file: {file_name}")
     sdc_file = ""
     fr_file = ""
+    top_level_file = ""
     if args.mode == "tune" and args.algorithm == "ax":
         config = list()
     else:
@@ -357,6 +358,8 @@ def read_config(file_name):
     for key, value in data.items():
         if key == "best_result":
             continue
+        if key == "_TOP_LEVEL_FILE_PATH" and value != "":
+            top_level_file = f"{os.path.dirname(file_name)}/{value}"
         if key == "_SDC_FILE_PATH" and value != "":
             if sdc_file != "":
                 print("[WARNING TUN-0004] Overwriting SDC base file.")
@@ -375,7 +378,7 @@ def read_config(file_name):
                     config.append(param_dict)
             elif args.mode == "tune" and args.algorithm == "pbt":
                 param_dict = read_tune_pbt(key, value)
-                if param_dict:
+                if param_dict: 
                     config[key] = param_dict
             else:
                 config[key] = value
@@ -389,7 +392,7 @@ def read_config(file_name):
             config[key] = read_tune(value)
     if args.mode == "tune":
         config = apply_condition(config, data)
-    return config, sdc_file, fr_file
+    return config, sdc_file, fr_file, top_level_file
 
 
 def parse_flow_variables():
@@ -716,13 +719,6 @@ def parse_arguments():
         metavar="<sky130hd,sky130hs,asap7,...>",
         required=True,
         help="Name of the platform for Autotuning.",
-    )
-    parser.add_argument(
-        "--top_fn",
-        type=str,
-        metavar="<path>",
-        required=True,
-        help="Filename of the top-level module in which parameters and defines are set.",
     )
 
     # Experiment Setup
@@ -1079,12 +1075,11 @@ def sweep():
 
 if __name__ == "__main__":
     args = parse_arguments()
-    cur_path = os.path.dirname(os.path.realpath(__file__))
-    verilog_rewriter = VerilogRewriter(os.path.join(cur_path, f"../../../../flow/designs/src/{args.design}/{args.top_fn}"))
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
-    config_dict, SDC_ORIGINAL, FR_ORIGINAL = read_config(os.path.abspath(args.config))
+    config_dict, SDC_ORIGINAL, FR_ORIGINAL, TOP_LEVEL_FILE = read_config(os.path.abspath(args.config))
+    verilog_rewriter = VerilogRewriter(TOP_LEVEL_FILE)
 
     # Connect to remote Ray server if any, otherwise will run locally
     if args.server is not None:
