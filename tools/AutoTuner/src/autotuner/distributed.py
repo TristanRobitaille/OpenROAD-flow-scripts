@@ -351,6 +351,7 @@ def read_config(file_name):
     sdc_file = ""
     fr_file = ""
     top_level_file = ""
+    pkg_file = ""
     if args.mode == "tune" and args.algorithm == "ax":
         config = list()
     else:
@@ -360,6 +361,8 @@ def read_config(file_name):
             continue
         if key == "_TOP_LEVEL_FILE_PATH" and value != "":
             top_level_file = f"{os.path.dirname(file_name)}/{value}"
+        if key == "_PACKGAGE_FILE_PATH" and value != "":
+            pkg_file = f"{os.path.dirname(file_name)}/{value}"
         if key == "_SDC_FILE_PATH" and value != "":
             if sdc_file != "":
                 print("[WARNING TUN-0004] Overwriting SDC base file.")
@@ -392,7 +395,7 @@ def read_config(file_name):
             config[key] = read_tune(value)
     if args.mode == "tune":
         config = apply_condition(config, data)
-    return config, sdc_file, fr_file, top_level_file
+    return config, sdc_file, fr_file, top_level_file, pkg_file
 
 
 def parse_flow_variables():
@@ -439,10 +442,7 @@ def parse_config(config, path=os.getcwd()):
     Parse configuration received from tune into make variables.
     """
     options = ""
-    sdc = {}
-    fast_route = {}
-    params = {}
-    defines = {}
+    sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
     for key, value in config.items():
         # Keys that begin with underscore need special handling.
@@ -453,10 +453,14 @@ def parse_config(config, path=os.getcwd()):
             # Variables to be injected into constraints.sdc
             elif key.startswith("_SDC_"):
                 sdc[key.replace("_SDC_", "", 1)] = value
-            elif key.startswith("_PARAM_"):
-                params[key.replace("_PARAM_", "", 1)] = value
-            elif key.startswith("_DEF_"):
-                defines[key.replace("_DEF_", "", 1)] = value
+            elif key.startswith("_TOP_PARAM_"):
+                top_params[key.replace("_TOP_PARAM_", "", 1)] = value
+            elif key.startswith("_TOP_DEF_"):
+                top_defines[key.replace("_TOP_DEF_", "", 1)] = value
+            elif key.startswith("_PACKAGE_PARAM_"):
+                pkg_params[key.replace("_PACKAGE_PARAM_", "", 1)] = value
+            elif key.startswith("_PACKAGE_DEF_"):
+                pkg_defines[key.replace("_PACKAGE_DEF_", "", 1)] = value
             # Special substitution cases
             elif key == "_PINS_DISTANCE":
                 options += f' PLACE_PINS_ARGS="-min_distance {value}"'
@@ -475,14 +479,17 @@ def parse_config(config, path=os.getcwd()):
             #     print(f"[ERROR TUN-0017] Variable {key} is not tunable.")
             #     sys.exit(1)
             options += f" {key}={value}"
+
+    print("here")
+
     if bool(sdc):
         write_sdc(sdc, path)
         options += f" SDC_FILE={path}/{CONSTRAINTS_SDC}"
     if bool(fast_route):
         write_fast_route(fast_route, path)
         options += f" FASTROUTE_TCL={path}/{FASTROUTE_TCL}"
-    if bool(params) or bool(defines):
-        verilog_rewriter.update_sv(defines, params)
+    if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
+        verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
     return options
 
 
@@ -1078,8 +1085,8 @@ if __name__ == "__main__":
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
-    config_dict, SDC_ORIGINAL, FR_ORIGINAL, TOP_LEVEL_FILE = read_config(os.path.abspath(args.config))
-    verilog_rewriter = VerilogRewriter(TOP_LEVEL_FILE)
+    config_dict, SDC_ORIGINAL, FR_ORIGINAL, TOP_LEVEL_FILE, PKG_FILE = read_config(os.path.abspath(args.config))
+    verilog_rewriter = VerilogRewriter(top_fp=TOP_LEVEL_FILE, pkg_fp=PKG_FILE)
 
     # Connect to remote Ray server if any, otherwise will run locally
     if args.server is not None:
@@ -1147,7 +1154,7 @@ if __name__ == "__main__":
         _ = ray.get(task_id)
         print(f"[INFO TUN-0002] Best parameters found: {analysis.best_config}")
 
-        verilog_rewriter.reset_sv()
+        verilog_rewriter.reset()
 
         # if all runs have failed
         if analysis.best_result["minimum"] == ERROR_METRIC:
