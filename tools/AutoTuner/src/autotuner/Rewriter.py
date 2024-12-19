@@ -73,7 +73,10 @@ class VerilogRewriter():
                 if node.declarators[0].name.valueText in params_left.keys():
                     start = node.declarators[0].getLastToken().range.start.offset + self.top_char_offset_from_insertion
                     end = node.declarators[0].getLastToken().range.end.offset + self.top_char_offset_from_insertion
-                    self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.top_fp)
+                    if is_for_pkg:
+                        self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.pkg_fp)
+                    else:
+                        self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.top_fp)
                     del params_left[node.declarators[0].name.valueText]
 
             elif isinstance(node, pyslang.Token): # Define
@@ -81,7 +84,10 @@ class VerilogRewriter():
                     if trivia.kind == pyslang.TriviaKind.Directive and trivia.syntax().kind == pyslang.SyntaxKind.DefineDirective and trivia.syntax().name.valueText in defines_left.keys():
                         start = trivia.syntax().getLastToken().range.start.offset + self.top_char_offset_from_insertion
                         end = trivia.syntax().getLastToken().range.end.offset + self.top_char_offset_from_insertion
-                        self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.top_fp)
+                        if is_for_pkg:
+                            self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.pkg_fp)
+                        else:
+                            self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.top_fp)
                         del defines_left[trivia.syntax().name.valueText]
 
             if not defines_left and not params_left:
@@ -125,8 +131,6 @@ class VerilogRewriter():
 
         Returns: None
         """
-
-        copy2(self.top_backup_path, self.top_fp)
-        remove(self.top_backup_path)
-        copy2(self.pkg_backup_path, self.pkg_fp)
-        remove(self.pkg_backup_path)
+        for (backup_path, fp) in [(self.top_backup_path, self.top_fp), (self.pkg_backup_path, self.pkg_fp)]:
+            copy2(backup_path, fp)
+            remove(backup_path)

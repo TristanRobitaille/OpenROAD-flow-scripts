@@ -278,19 +278,22 @@ def read_config(file_name):
         return config
 
     def read_tune(this):
-        min_, max_ = this["minmax"]
-        if min_ == max_:
-            # Returning a choice of a single element allow pbt algorithm to
-            # work. pbt does not accept single values as tunable.
-            return tune.choice([min_, max_])
-        if this["type"] == "int":
-            if this["step"] == 1:
-                return tune.randint(min_, max_)
-            return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
-        if this["type"] == "float":
-            if this["step"] == 0:
-                return tune.uniform(min_, max_)
-            return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
+        if this["type"] == "choice":
+            return tune.choice(this["values"])
+        else:
+            min_, max_ = this["minmax"]
+            if min_ == max_:
+                # Returning a choice of a single element allow pbt algorithm to
+                # work. pbt does not accept single values as tunable.
+                return tune.choice([min_, max_])
+            if this["type"] == "int":
+                if this["step"] == 1:
+                    return tune.randint(min_, max_)
+                return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
+            elif this["type"] == "float":
+                if this["step"] == 0:
+                    return tune.uniform(min_, max_)
+                return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
         return None
 
     def read_tune_ax(name, this):
@@ -298,6 +301,20 @@ def read_config(file_name):
         Ax format: https://ax.dev/versions/0.3.7/api/service.html
         """
         dict_ = dict(name=name)
+    
+        if this["type"] == "choice":
+            dict_["type"] = "choice"
+            dict_["values"] = this["values"]
+            dict_["is_ordered"] = False
+            dict_["sort_values"] = False
+            if isinstance(this["values"][0], str):
+                dict_["value_type"] = "str"
+            elif isinstance(this["values"][0], int):
+                dict_["value_type"] = "int"
+            elif isinstance(this["values"][0], float):
+                dict_["value_type"] = "float"
+            return dict_
+
         if "minmax" not in this:
             return None
         min_, max_ = this["minmax"]
@@ -308,38 +325,23 @@ def read_config(file_name):
             if this["step"] == 1:
                 dict_["type"] = "range"
                 dict_["bounds"] = [min_, max_]
-                dict_["value_type"] = "int"
             else:
                 dict_["type"] = "choice"
-                dict_["values"] = tune.randint(min_, max_, this["step"])
-                dict_["value_type"] = "int"
+                dict_["values"] = np.arange(min_, max_, this["step"]).tolist()
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
+            dict_["value_type"] = "int"
         elif this["type"] == "float":
             if this["step"] == 1:
                 dict_["type"] = "choice"
-                dict_["values"] = tune.choice(
-                    np.ndarray.tolist(np.arange(min_, max_, this["step"]))
-                )
-                dict_["value_type"] = "float"
+                dict_["values"] = np.arange(min_, max_, this["step"]).tolist()
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
             else:
                 dict_["type"] = "range"
                 dict_["bounds"] = [min_, max_]
-                dict_["value_type"] = "float"
+            dict_["value_type"] = "float"
         return dict_
-
-    def read_tune_pbt(name, this):
-        """
-        PBT format: https://docs.ray.io/en/releases-2.9.3/tune/examples/pbt_guide.html
-        Note that PBT does not support step values.
-        """
-        if "minmax" not in this:
-            return None
-        min_, max_ = this["minmax"]
-        if min_ == max_:
-            return ray.tune.choice([min_, max_])
-        if this["type"] == "int":
-            return ray.tune.randint(min_, max_)
-        if this["type"] == "float":
-            return ray.tune.uniform(min_, max_)
 
     # Check file exists and whether it is a valid JSON file.
     assert os.path.isfile(file_name), f"File {file_name} not found."
@@ -360,9 +362,15 @@ def read_config(file_name):
         if key == "best_result":
             continue
         if key == "_TOP_LEVEL_FILE_PATH" and value != "":
+            if top_level_file != "":
+                print("[WARNING TUN-0004] Overwriting top level base file.")
             top_level_file = f"{os.path.dirname(file_name)}/{value}"
+            continue
         if key == "_PACKGAGE_FILE_PATH" and value != "":
+            if pkg_file != "":
+                print("[WARNING TUN-0004] Overwriting package base file.")
             pkg_file = f"{os.path.dirname(file_name)}/{value}"
+            continue
         if key == "_SDC_FILE_PATH" and value != "":
             if sdc_file != "":
                 print("[WARNING TUN-0004] Overwriting SDC base file.")
@@ -380,7 +388,7 @@ def read_config(file_name):
                 if param_dict:
                     config.append(param_dict)
             elif args.mode == "tune" and args.algorithm == "pbt":
-                param_dict = read_tune_pbt(key, value)
+                param_dict = read_tune(value)
                 if param_dict: 
                     config[key] = param_dict
             else:
@@ -390,11 +398,16 @@ def read_config(file_name):
         elif args.mode == "tune" and args.algorithm == "ax":
             config.append(read_tune_ax(key, value))
         elif args.mode == "tune" and args.algorithm == "pbt":
-            config[key] = read_tune_pbt(key, value)
+            config[key] = read_tune(value)
         elif args.mode == "tune":
             config[key] = read_tune(value)
     if args.mode == "tune":
         config = apply_condition(config, data)
+
+    if top_level_file == "":
+        print("WARNING: No top-level file provided.")
+    if pkg_file == "":
+        print("WARNING: No package file provided.")
     return config, sdc_file, fr_file, top_level_file, pkg_file
 
 
@@ -479,8 +492,6 @@ def parse_config(config, path=os.getcwd()):
             #     print(f"[ERROR TUN-0017] Variable {key} is not tunable.")
             #     sys.exit(1)
             options += f" {key}={value}"
-
-    print("here")
 
     if bool(sdc):
         write_sdc(sdc, path)
@@ -931,7 +942,6 @@ def parse_arguments():
     if arguments.timeout is not None:
         arguments.timeout = round(arguments.timeout * 3600)
 
-    # TODO: Remove once fixed
     if (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
         print(f"Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
 
