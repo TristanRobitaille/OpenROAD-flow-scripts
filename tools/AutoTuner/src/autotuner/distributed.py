@@ -27,6 +27,7 @@ Parameter sweeping:
 import argparse
 import json
 import os
+import shutil
 import re
 import sys
 import glob
@@ -71,23 +72,23 @@ METRICS_MAP = {
     "floorplan": {  "total_power"   : ["floorplan", "power__total"],
                     "core_util"     : ["floorplan", "design__instance__utilization"],
                     "worst_slack"   : ["floorplan", "timing__setup__ws"]},
-    
+
     "place": {      "total_power"   : ["detailedplace", "power__total"],
                     "wirelength"    : ["detailedplace", "route__wirelength__estimated"],
                     "core_util"     : ["detailedplace", "design__instance__utilization"],
                     "worst_slack"   : ["detailedplace", "timing__setup__ws"]},
-    
+
     "cts": {        "total_power"   : ["cts", "power__total"],
                     "wirelength"    : ["cts", "route__wirelength__estimated"],
                     "core_util"     : ["cts", "design__instance__utilization"],
                     "worst_slack"   : ["cts", "timing__setup__ws"]},
-    
+
     "route": {      "total_power"   : ["globalroute","power__total"],
                     "wirelength"    : ["detailedroute","route__wirelength"],
                     "core_util"     : ["globalroute", "design__instance__utilization"],
                     "num_drc"       : ["detailedroute","route__drc_errors"],
                     "worst_slack"   : ["globalroute", "timing__setup__ws"]},
-    
+
     "all": {        "total_power"   : ["finish", "power__total"],
                     "wirelength"    : ["detailedroute","route__wirelength"],
                     "core_util"     : ["globalroute", "design__instance__utilization"],
@@ -118,19 +119,45 @@ class AutoTunerBase(tune.Trainable):
         # <repo>/<logs>/<platform>/<design>/<experiment>-DATE/<id>/<cwd>
         repo_dir = os.getcwd() + "/../" * 6
         self.repo_dir = os.path.abspath(repo_dir)
-        self.parameters = parse_config(config, path=os.getcwd())
         self.step_ = 0
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
+        self.copy_dir = os.getcwd() + f"/{self.variant}"
+
+        # Make list of patterns to ignore when copying the repo to reduce the size of the copy
+        dont_copy = ["logs", "reports", "results", "objects", "docs"]
+        for pattern, directory in [(args.platform, "platforms"), (args.platform, "designs"), (args.design, "designs/src")]:
+            target_dir = f"{ORFS_FLOW_DIR}/{directory}"
+            all_patterns = [d for d in os.listdir(target_dir)
+                            if os.path.isdir(os.path.join(target_dir, d))]
+            other_patterns = [p for p in all_patterns if (p != pattern and p != "src" and p != "common")]
+            dont_copy.extend(other_patterns)
+
+        shutil.copytree(
+            self.repo_dir,
+            self.copy_dir,
+            ignore=shutil.ignore_patterns(*dont_copy)
+        )
+
+        sdc_file_path = f"{self.copy_dir}/{config['sdc_file_path']}"
+        fr_file_path = f"{self.copy_dir}/{config['fr_file_path']}"
+        top_level_file_path = f"{self.copy_dir}/{config['top_level_file_path']}"
+        pkg_file_path = f"{self.copy_dir}/{config['pkg_file_path']}"
+        del config["sdc_file_path"]
+        del config["fr_file_path"]
+        del config["top_level_file_path"]
+        del config["pkg_file_path"]
+
+        self.parameters = parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_file_path)
 
     def step(self):
         """
         Run step experiment and compute its score.
         """
-        metrics_file = openroad(self.repo_dir, self.parameters, self.variant)
+        metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
         self.step_ += 1
         score = self.evaluate(self.read_metrics(metrics_file))
-        # Feed the score back to Tune.
-        # return must match 'metric' used in tune.run()
+        # Feed the score back to Tune. return must match 'metric' used in tune.run()
+        print(f"score: {score}")
         return {METRIC: score}
 
     def evaluate(self, metrics):
@@ -139,6 +166,8 @@ class AutoTunerBase(tune.Trainable):
         It can change in any form to minimize the score (return value).
         Default evaluation function optimizes effective clock period.
         """
+
+        print(f"metrics: {metrics}")
 
         if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
             return ERROR_METRIC
@@ -221,8 +250,8 @@ class PPAImprov(AutoTunerBase):
         for metric in expected_metrics:
             if metrics[metric] == "N/A" or reference[metric] == "N/A":
                 return ERROR_METRIC
-       
-        ppa = self.get_ppa(metrics)        
+
+        ppa = self.get_ppa(metrics)
         score = ppa * (self.step_ / 100) ** (-1)
         if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
             gamma = ppa / 10
@@ -240,15 +269,6 @@ def read_config(file_name):
     step value is used for quantized type (e.g., quniform). Otherwise, write 0.
     When min==max, it means the constant value
     """
-
-    def read(path):
-        # if file path does not exist, return empty string
-        print(os.path.abspath(path))
-        if not os.path.isfile(os.path.abspath(path)):
-            return ""
-        with open(os.path.abspath(path), "r") as file:
-            ret = file.read()
-        return ret
 
     def read_sweep(this):
         return [*this["minmax"], this["step"]]
@@ -301,7 +321,7 @@ def read_config(file_name):
         Ax format: https://ax.dev/versions/0.3.7/api/service.html
         """
         dict_ = dict(name=name)
-    
+
         if this["type"] == "choice":
             dict_["type"] = "choice"
             dict_["values"] = this["values"]
@@ -363,23 +383,27 @@ def read_config(file_name):
             continue
         if key == "_TOP_LEVEL_FILE_PATH" and value != "":
             if top_level_file != "":
-                print("[WARNING TUN-0004] Overwriting top level base file.")
-            top_level_file = f"{os.path.dirname(file_name)}/{value}"
+                print("[WARNING TUN-0004] Obtained more than one file path for the top-level file.")
+            full_path = f"{os.path.dirname(file_name)}/{value}"
+            top_level_file = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
         if key == "_PACKGAGE_FILE_PATH" and value != "":
             if pkg_file != "":
-                print("[WARNING TUN-0004] Overwriting package base file.")
-            pkg_file = f"{os.path.dirname(file_name)}/{value}"
+                print("[WARNING TUN-0004] Obtained more than one file path for the package file.")
+            full_path = f"{os.path.dirname(file_name)}/{value}"
+            pkg_file = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
         if key == "_SDC_FILE_PATH" and value != "":
             if sdc_file != "":
-                print("[WARNING TUN-0004] Overwriting SDC base file.")
-            sdc_file = read(f"{os.path.dirname(file_name)}/{value}")
+                print("[WARNING TUN-0004] Obtained more than one file path for the SDC file.")
+            full_path = f"{os.path.dirname(file_name)}/{value}"
+            sdc_file = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
         if key == "_FR_FILE_PATH" and value != "":
             if fr_file != "":
-                print("[WARNING TUN-0005] Overwriting FastRoute base file.")
-            fr_file = read(f"{os.path.dirname(file_name)}/{value}")
+                print("[WARNING TUN-0005] Obtained more than one file path for the FastRoute file.")
+            full_path = f"{os.path.dirname(file_name)}/{value}"
+            fr_file = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
         if not isinstance(value, dict):
             # To take care of empty values like _FR_FILE_PATH
@@ -389,7 +413,7 @@ def read_config(file_name):
                     config.append(param_dict)
             elif args.mode == "tune" and args.algorithm == "pbt":
                 param_dict = read_tune(value)
-                if param_dict: 
+                if param_dict:
                     config[key] = param_dict
             else:
                 config[key] = value
@@ -450,13 +474,14 @@ def parse_flow_variables():
     return variables
 
 
-def parse_config(config, path=os.getcwd()):
+def parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_file_path):
     """
     Parse configuration received from tune into make variables.
     """
     options = ""
     sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
+    verilog_rewriter = VerilogRewriter(top_fp=top_level_file_path, pkg_fp=pkg_file_path)
     for key, value in config.items():
         # Keys that begin with underscore need special handling.
         if key.startswith("_"):
@@ -494,90 +519,89 @@ def parse_config(config, path=os.getcwd()):
             options += f" {key}={value}"
 
     if bool(sdc):
-        write_sdc(sdc, path)
-        options += f" SDC_FILE={path}/{CONSTRAINTS_SDC}"
+        write_sdc(sdc, sdc_file_path)
+        options += f" SDC_FILE={sdc_file_path}"
     if bool(fast_route):
-        write_fast_route(fast_route, path)
-        options += f" FASTROUTE_TCL={path}/{FASTROUTE_TCL}"
+        write_fast_route(fast_route, fr_file_path)
+        options += f" FASTROUTE_TCL={fr_file_path}"
     if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
         verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
     return options
 
 
-def write_sdc(variables, path):
+def write_sdc(variables, sdc_file_path):
     """
     Create a SDC file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist
-    if SDC_ORIGINAL == "":
+    with open(sdc_file_path, "r") as file:
+        sdc_content = file.read()
+
+    if sdc_content == "":
         print("[ERROR TUN-0020] No SDC reference file provided.")
         sys.exit(1)
-    new_file = SDC_ORIGINAL
     for key, value in variables.items():
         if key == "CLK_PERIOD":
-            if new_file.find("set clk_period") != -1:
-                new_file = re.sub(
-                    r"set clk_period .*\n(.*)", f"set clk_period {value}\n\\1", new_file
+            if sdc_content.find("set clk_period") != -1:
+                sdc_content = re.sub(
+                    r"set clk_period .*\n(.*)", f"set clk_period {value}\n\\1", sdc_content
                 )
             else:
-                new_file = re.sub(
-                    r"-period [0-9\.]+ (.*)", f"-period {value} \\1", new_file
+                sdc_content = re.sub(
+                    r"-period [0-9\.]+ (.*)", f"-period {value} \\1", sdc_content
                 )
-                new_file = re.sub(r"-waveform [{}\s0-9\.]+[\s|\n]", "", new_file)
+                sdc_content = re.sub(r"-waveform [{}\s0-9\.]+[\s|\n]", "", sdc_content)
         elif key == "UNCERTAINTY":
-            if new_file.find("set uncertainty") != -1:
-                new_file = re.sub(
+            if sdc_content.find("set uncertainty") != -1:
+                sdc_content = re.sub(
                     r"set uncertainty .*\n(.*)",
                     f"set uncertainty {value}\n\\1",
-                    new_file,
+                    sdc_content,
                 )
             else:
-                new_file += f"\nset uncertainty {value}\n"
+                sdc_content += f"\nset uncertainty {value}\n"
         elif key == "IO_DELAY":
-            if new_file.find("set io_delay") != -1:
-                new_file = re.sub(
-                    r"set io_delay .*\n(.*)", f"set io_delay {value}\n\\1", new_file
+            if sdc_content.find("set io_delay") != -1:
+                sdc_content = re.sub(
+                    r"set io_delay .*\n(.*)", f"set io_delay {value}\n\\1", sdc_content
                 )
             else:
-                new_file += f"\nset io_delay {value}\n"
-    file_name = path + f"/{CONSTRAINTS_SDC}"
-    with open(file_name, "w") as file:
-        file.write(new_file)
-    return file_name
+                sdc_content += f"\nset io_delay {value}\n"
+    with open(sdc_file_path, "w") as file:
+        file.write(sdc_content)
 
 
-def write_fast_route(variables, path):
+def write_fast_route(variables, fr_file_path):
     """
     Create a FastRoute Tcl file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist (asap7 doesn't have reference)
-    if FR_ORIGINAL == "" and args.platform != "asap7":
+    with open(fr_file_path, "r") as file:
+        fr_content = file.read()
+
+    if fr_content == "" and args.platform != "asap7":
         print("[ERROR TUN-0021] No FastRoute Tcl reference file provided.")
         sys.exit(1)
     layer_cmd = "set_global_routing_layer_adjustment"
-    new_file = FR_ORIGINAL
     for key, value in variables.items():
         if key.startswith("LAYER_ADJUST"):
             layer = key.lstrip("LAYER_ADJUST")
-            # If there is no suffix (i.e., layer name) apply adjust to all
-            # layers.
+            # If there is no suffix (i.e., layer name) apply adjust to all layers.
             if layer == "":
-                new_file += "\nset_global_routing_layer_adjustment"
-                new_file += " $::env(MIN_ROUTING_LAYER)"
-                new_file += "-$::env(MAX_ROUTING_LAYER)"
-                new_file += f" {value}"
-            elif re.search(f"{layer_cmd}.*{layer}", new_file):
-                new_file = re.sub(
-                    f"({layer_cmd}.*{layer}).*\n(.*)", f"\\1 {value}\n\\2", new_file
+                fr_content += "\nset_global_routing_layer_adjustment"
+                fr_content += " $::env(MIN_ROUTING_LAYER)"
+                fr_content += "-$::env(MAX_ROUTING_LAYER)"
+                fr_content += f" {value}"
+            elif re.search(f"{layer_cmd}.*{layer}", fr_content):
+                fr_content = re.sub(
+                    f"({layer_cmd}.*{layer}).*\n(.*)", f"\\1 {value}\n\\2", fr_content
                 )
             else:
-                new_file += f"\n{layer_cmd} {layer} {value}\n"
+                fr_content += f"\n{layer_cmd} {layer} {value}\n"
         elif key == "GR_SEED":
-            new_file += f"\nset_global_routing_random -seed {value}\n"
-    file_name = path + f"/{FASTROUTE_TCL}"
-    with open(file_name, "w") as file:
-        file.write(new_file)
-    return file_name
+            fr_content += f"\nset_global_routing_random -seed {value}\n"
+    with open(fr_file_path, "w") as file:
+        file.write(fr_content)
 
 
 def run_command(cmd, timeout=None, stderr_file=None, stdout_file=None, fail_fast=False):
@@ -624,8 +648,8 @@ def openroad(base_dir, parameters, flow_variant, path=""):
     else:
         log_path = report_path = os.getcwd() + "/"
 
-    export_command = f"export PATH={INSTALL_PATH}/OpenROAD/bin"
-    export_command += f":{INSTALL_PATH}/yosys/bin:$PATH"
+    export_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
+    export_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
     export_command += " && "
 
     make_command = export_command
@@ -639,6 +663,7 @@ def openroad(base_dir, parameters, flow_variant, path=""):
     make_command += f" FLOW_VARIANT={flow_variant} {parameters}"
     make_command += f" EQUIVALENCE_CHECK=0"
     make_command += f" NPROC={args.openroad_threads} SHELL=bash"
+    run_command(f"cd {base_dir}")
     run_command(
         make_command,
         timeout=args.timeout,
@@ -1039,7 +1064,7 @@ def save_best(results):
     best_config["coeff_area"] = COEFF_AREA
     best_config["coeff_power"] = COEFF_POWER
     trial_id = results.best_trial.trial_id
-    new_best_path = f"{LOCAL_DIR}/{args.experiment}/"
+    new_best_path = f"{BASE_LOCAL_DIR}/{args.experiment}/"
     new_best_path += f"autotuner-best-{trial_id}.json"
     with open(new_best_path, "w") as new_best_file:
         json.dump(best_config, new_best_file, indent=4)
@@ -1063,10 +1088,10 @@ def sweep():
         # For remote sweep we create the following directory structure:
         #      1/     2/         3/       4/
         # <repo>/<logs>/<platform>/<design>/
-        repo_dir = os.path.abspath(LOCAL_DIR + "/../" * 4)
+        repo_dir = os.path.abspath(BASE_LOCAL_DIR + "/../" * 4)
     else:
         repo_dir = os.path.abspath("../")
-    print(f"[INFO TUN-0012] Log folder {LOCAL_DIR}.")
+    print(f"[INFO TUN-0012] Log folder {BASE_LOCAL_DIR}.")
     queue = Queue()
     parameter_list = list()
     for name, content in config_dict.items():
@@ -1083,7 +1108,7 @@ def sweep():
         for value in parameter:
             temp.update(value)
         print(temp)
-        queue.put([repo_dir, temp, LOCAL_DIR])
+        queue.put([repo_dir, temp, BASE_LOCAL_DIR])
     workers = [consumer.remote(queue) for _ in range(args.jobs)]
     print("[INFO TUN-0009] Waiting for results.")
     ray.get(workers)
@@ -1095,38 +1120,38 @@ if __name__ == "__main__":
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
-    config_dict, SDC_ORIGINAL, FR_ORIGINAL, TOP_LEVEL_FILE, PKG_FILE = read_config(os.path.abspath(args.config))
-    verilog_rewriter = VerilogRewriter(top_fp=TOP_LEVEL_FILE, pkg_fp=PKG_FILE)
+    config_dict, sdc_file_rel, fr_file_rel, top_level_file_rel, pkg_file_rel = read_config(os.path.abspath(args.config))
 
     # Connect to remote Ray server if any, otherwise will run locally
+    # TODO: Fix directory structure for server runs.
     if args.server is not None:
         # At GCP we have a NFS folder that is present for all worker nodes.
         # This allows to build required binaries once. We clone, build and
-        # store intermediate files at LOCAL_DIR.
+        # store intermediate files at BASE_LOCAL_DIR.
         with open(args.config) as config_file:
-            LOCAL_DIR = "/shared-data/autotuner"
-            LOCAL_DIR += f"-orfs-{args.git_orfs_branch}"
+            BASE_LOCAL_DIR = "/shared-data/autotuner"
+            BASE_LOCAL_DIR += f"-orfs-{args.git_orfs_branch}"
             if args.git_or_branch != "":
-                LOCAL_DIR += f"-or-{args.git_or_branch}"
+                BASE_LOCAL_DIR += f"-or-{args.git_or_branch}"
             if args.git_latest:
-                LOCAL_DIR += "-or-latest"
+                BASE_LOCAL_DIR += "-or-latest"
         # Connect to ray server before first remote execution.
         ray.init(f"ray://{args.server}:{args.port}")
         # Remote functions return a task id and are non-blocking. Since we
         # need the setup repo before continuing, we call ray.get() to wait
         # for its completion.
-        INSTALL_PATH = ray.get(setup_repo.remote(LOCAL_DIR))
-        LOCAL_DIR += f"/flow/logs/{args.platform}/{args.design}"
+        BASE_INSTALL_PATH = ray.get(setup_repo.remote(BASE_LOCAL_DIR))
+        BASE_LOCAL_DIR += f"/flow/logs/{args.platform}/{args.design}"
         print("[INFO TUN-0001] NFS setup completed.")
     else:
         # For local runs, use the same folder as other ORFS utilities.
-        ORFS_FLOW_DIR = os.path.abspath(
+        BASE_ORFS_FLOW_DIR = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../../../flow")
         )
-        os.chdir(ORFS_FLOW_DIR)
-        LOCAL_DIR = f"logs/{args.platform}/{args.design}"
-        LOCAL_DIR = os.path.abspath(LOCAL_DIR)
-        INSTALL_PATH = os.path.abspath("/foss/tools")
+        os.chdir(BASE_ORFS_FLOW_DIR)
+        BASE_LOCAL_DIR = f"logs/{args.platform}/{args.design}"
+        BASE_LOCAL_DIR = os.path.abspath(BASE_LOCAL_DIR)
+        BASE_INSTALL_PATH = os.path.abspath("/foss/tools")
 
     if args.mode == "tune":
         best_params = set_best_params(args.platform, args.design)
@@ -1136,13 +1161,19 @@ if __name__ == "__main__":
         if args.eval == "ppa-improv":
             reference = PPAImprov.read_metrics(args.reference)
 
+        config_dict.update({
+            "sdc_file_path": sdc_file_rel,
+            "fr_file_path": fr_file_rel,
+            "top_level_file_path": top_level_file_rel,
+            "pkg_file_path": pkg_file_rel
+        })
         tune_args = dict(
             name=args.experiment,
             metric=METRIC,
             mode="min",
             num_samples=args.samples,
             fail_fast=False,
-            local_dir=LOCAL_DIR,
+            local_dir=BASE_LOCAL_DIR,
             resume=args.resume,
             stop={"training_iteration": args.iterations},
             resources_per_trial={"cpu": args.resources_per_trial},
@@ -1163,8 +1194,6 @@ if __name__ == "__main__":
         task_id = save_best.remote(analysis)
         _ = ray.get(task_id)
         print(f"[INFO TUN-0002] Best parameters found: {analysis.best_config}")
-
-        verilog_rewriter.reset()
 
         # if all runs have failed
         if analysis.best_result["minimum"] == ERROR_METRIC:

@@ -19,10 +19,6 @@ class VerilogRewriter():
         self.pkg_fp = Path(pkg_fp)
         self.top_char_offset_from_insertion = 0
         self.pkg_char_offset_from_insertion = 0
-        self.top_backup_path = self.top_fp.with_name(f"{self.top_fp.stem}_ref{self.top_fp.suffix}.temp")
-        self.pkg_backup_path = self.pkg_fp.with_name(f"{self.pkg_fp.stem}_ref{self.pkg_fp.suffix}.temp")
-        copy2(self.top_fp, self.top_backup_path)
-        copy2(self.pkg_fp, self.pkg_backup_path)
 
     def _replace_in_file(self, start_pos:int, end_pos:int, new_text:str, fp:str) -> int:
         """
@@ -69,7 +65,7 @@ class VerilogRewriter():
         module = tree.root.members[0]
 
         def visit_and_update(node):
-            if (node.kind == pyslang.SyntaxKind.ParameterDeclaration): # Parameter
+            if (node.kind == pyslang.SyntaxKind.ParameterDeclaration): # Parameters
                 if node.declarators[0].name.valueText in params_left.keys():
                     start = node.declarators[0].getLastToken().range.start.offset + self.top_char_offset_from_insertion
                     end = node.declarators[0].getLastToken().range.end.offset + self.top_char_offset_from_insertion
@@ -79,7 +75,7 @@ class VerilogRewriter():
                         self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.top_fp)
                     del params_left[node.declarators[0].name.valueText]
 
-            elif isinstance(node, pyslang.Token): # Define
+            elif isinstance(node, pyslang.Token): # Defines
                 for trivia in node.trivia:
                     if trivia.kind == pyslang.TriviaKind.Directive and trivia.syntax().kind == pyslang.SyntaxKind.DefineDirective and trivia.syntax().name.valueText in defines_left.keys():
                         start = trivia.syntax().getLastToken().range.start.offset + self.top_char_offset_from_insertion
@@ -122,15 +118,3 @@ class VerilogRewriter():
 
         self._update_file(top_new_def, top_new_params, is_for_pkg=False)
         self._update_file(pkg_new_def, pkg_new_params, is_for_pkg=True)
-
-    def reset(self) -> None:
-        """
-        Reset the top-level and package files to their original state.
-
-        Parameters: None
-
-        Returns: None
-        """
-        for (backup_path, fp) in [(self.top_backup_path, self.top_fp), (self.pkg_backup_path, self.pkg_fp)]:
-            copy2(backup_path, fp)
-            remove(backup_path)
