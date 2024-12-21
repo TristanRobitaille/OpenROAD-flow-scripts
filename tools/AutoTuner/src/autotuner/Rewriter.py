@@ -1,18 +1,37 @@
 """
-This class provides utility functions to rewrite the source code using Pyslang.
+Author: Tristan Robitaille, ETH Zürich 2024
+
+This class provides utility functions to overwrite parameters and defines in SystemVerilog source code using Pyslang.
+
+Usage:
+1. Initialize the VerilogRewriter with the paths to the top-level and package files.
+2. Use the update_sv method to update define directives and parameters in both files.
+
+Dependencies:
+- pyslang: For parsing and manipulating SystemVerilog syntax trees.
+- os: For file removal operations.
+- shutil: For file copying operations.
+- pathlib: For handling file paths.
+- copy: For deep copying dictionaries.
+- enum: For defining terminal tool messages.
+
+TODO:
+- Figure out why I get encoding error when reading the define text if using self.module instead of local module.
 """
 
 import pyslang
 from os import remove
+from enum import Enum
 from shutil import copy2
 from pathlib import Path
 from copy import deepcopy
 
-"""
-TODO
-- Figure out why I get encoding error when reading the define text if using self.module instead of local module.
-"""
+# ----- ENUMS ----- #
+class TerminalTool(Enum):
+    warning = "\033[93mVERILOG REWRITER WARNING\033[0m"
+    error = "\033[91mVERILOG REWRITER ERROR\033[0m"
 
+# ----- CLASSES ----- #
 class VerilogRewriter():
     def __init__(self, top_fp:str, pkg_fp:str):
         self.top_fp = Path(top_fp)
@@ -33,11 +52,24 @@ class VerilogRewriter():
         -int: Difference in length between the new text and the old text.
         """
         
-        with open(fp, 'r') as file:
-            content = file.read()
+        try:
+            with open(fp, 'r') as file:
+                content = file.read()
+        except FileNotFoundError:
+            print(f"{TerminalTool.error.value}: File {fp} not found.")
+            return 0
+        except IOError as e:
+            print(f"{TerminalTool.error.value}: IOError reading file {fp}. {e}")
+            return 0
+
         new_content = content[:start_pos] + new_text + content[end_pos:]
-        with open(f"{fp}", 'w') as file:
-            file.write(new_content)
+
+        try:
+            with open(fp, 'w') as file:
+                file.write(new_content)
+        except IOError as e:
+            print(f"{TerminalTool.error.value}: IOError writing to file {fp}. {e}")
+            return 0
 
         return len(new_text) - (end_pos - start_pos)
 
@@ -58,10 +90,14 @@ class VerilogRewriter():
         source_manager = pyslang.SourceManager()
         preprocessor_options = pyslang.PreprocessorOptions()
         options = pyslang.Bag([preprocessor_options])
-        if is_for_pkg:
-            tree = pyslang.SyntaxTree.fromFile(str(self.pkg_fp), source_manager, options)
-        else:
-            tree = pyslang.SyntaxTree.fromFile(str(self.top_fp), source_manager, options)
+        try:
+            if is_for_pkg:
+                tree = pyslang.SyntaxTree.fromFile(str(self.pkg_fp), source_manager, options)
+            else:
+                tree = pyslang.SyntaxTree.fromFile(str(self.top_fp), source_manager, options)
+        except Exception as e:
+            print(f"{TerminalTool.error.value}: Exception creating syntax tree. {e}")
+            return
         module = tree.root.members[0]
 
         def visit_and_update(node):
@@ -94,14 +130,14 @@ class VerilogRewriter():
 
         if defines_left:
             if is_for_pkg:
-                print(f"Warning: Did not find all defines to replace in package file: {defines_left}")
+                print(f"{TerminalTool.warning.value}: Did not find all defines to replace in package file: {defines_left}")
             else:
-                print(f"Warning: Did not find all defines to replace in top-level file: {defines_left}.")
+                print(f"{TerminalTool.warning.value}: Did not find all defines to replace in top-level file: {defines_left}.")
         if params_left:
             if is_for_pkg:
-                print(f"Warning: Did not find all parameters to replace in package file: {params_left}")
+                print(f"{TerminalTool.warning.value}: Did not find all parameters to replace in package file: {params_left}")
             else:
-                print(f"Warning: Did not find all parameters to replace in top-level file: {params_left}.")
+                print(f"{TerminalTool.warning.value}: Did not find all parameters to replace in top-level file: {params_left}.")
 
     def update_sv(self, top_new_def: dict, top_new_params: dict, pkg_new_def: dict, pkg_new_params: dict):
         """

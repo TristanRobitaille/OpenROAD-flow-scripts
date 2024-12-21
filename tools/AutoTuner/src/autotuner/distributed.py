@@ -110,8 +110,16 @@ class AutoTunerBase(tune.Trainable):
 
     def setup(self, config):
         """
-        Setup current experiment step.
+        Initializes the experimental setup for the AutoTunerBase class.
+
+        Prepares the environment by creating a directory structure,
+        copying the repository (excluding certain directories), and
+        setting up configuration parameters for the experiment.
+
+        Parameters:
+        - config (dict): Configuration parameters including file paths.
         """
+
         # We create the following directory structure:
         #      1/     2/         3/       4/                5/   6/
         # <repo>/<logs>/<platform>/<design>/<experiment>-DATE/<id>/<cwd>
@@ -140,10 +148,6 @@ class AutoTunerBase(tune.Trainable):
         fr_file_path = f"{self.copy_dir}/{config['fr_file_path']}"
         top_level_file_path = f"{self.copy_dir}/{config['top_level_file_path']}"
         pkg_file_path = f"{self.copy_dir}/{config['pkg_file_path']}"
-        del config["sdc_file_path"]
-        del config["fr_file_path"]
-        del config["top_level_file_path"]
-        del config["pkg_file_path"]
 
         self.parameters = parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_file_path)
 
@@ -164,8 +168,6 @@ class AutoTunerBase(tune.Trainable):
         It can change in any form to minimize the score (return value).
         Default evaluation function optimizes effective clock period.
         """
-
-        print(f"metrics: {metrics}")
 
         if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
             return ERROR_METRIC
