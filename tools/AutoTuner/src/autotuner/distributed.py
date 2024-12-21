@@ -96,8 +96,6 @@ METRICS_MAP = {
                     "worst_slack"   : ["finish", "timing__setup__ws"]}
 }
 
-COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 10000, 100, 100
-
 from enum import Enum
 # ----- ENUMS ----- #
 class TerminalTool(Enum):
@@ -219,6 +217,8 @@ class PPAImprov(AutoTunerBase):
         """
         Compute PPA term for evaluate.
         """
+        COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 1000, 100, 10
+
         assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
         assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
         assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")

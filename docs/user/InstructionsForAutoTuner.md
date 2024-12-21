@@ -5,10 +5,10 @@ AutoTuner provides a generic interface where users can define parameter configur
 This enables AutoTuner to easily support various tools and flows. AutoTuner also utilizes [METRICS2.1](https://github.com/ieee-ceda-datc/datc-rdf-Metrics4ML) to capture PPA
 of individual search trials. With the abundant features of METRICS2.1, users can explore various reward functions that steer the flow autotuning to different PPA goals.
 
-AutoTuner provides two main functionalities as follows.
+AutoTuner provides the following main functionalities.
 * Automatic hyperparameter tuning framework for OpenROAD-flow-script (ORFS)
+* Automatic parameter and define tuning framework for Verilog design (top-level and package) for Design Space Exploration (DSE)
 * Parametric sweeping experiments for ORFS
-
 
 AutoTuner contains top-level Python script for ORFS, each of which implements a different search algorithm. Current supported search algorithms are as follows.
 * Random/Grid Search
@@ -18,7 +18,11 @@ AutoTuner contains top-level Python script for ORFS, each of which implements a 
 * Tree Parzen Estimator + Covariance Matrix Adaptation Evolution Strategy ([Optuna](https://optuna.org/))
 * Evolutionary Algorithm ([Nevergrad](https://github.com/facebookresearch/nevergrad))
 
-User-defined coefficient values (`coeff_perform`, `coeff_power`, `coeff_area`) of three objectives to set the direction of tuning are written in the script. Each coefficient is expressed as a global variable at the `get_ppa` function in `PPAImprov` class in the script (`coeff_perform`, `coeff_power`, `coeff_area`). Efforts to optimize each of the objectives are proportional to the specified coefficients.
+User-defined coefficient values (`coeff_perform`, `coeff_power`, `coeff_area`) of three objectives to set the direction of tuning are written in the script. Each coefficient is expressed as a
+global variable at the `get_ppa` function in `PPAImprov` class in the script (`coeff_perform`, `coeff_power`, `coeff_area`). Efforts to optimize each of the objectives are proportional to the specified coefficients.
+
+AutoTuner uses Slang to overwrite `parameter` and `define` in a specified Verilog/SystemVerilog (usually the top-level or a wrapper) file and in a specified Verilog/SystemVerilog package file. This lets the user evaluate PPA
+for different design configurations.
 
 
 ## Setting up AutoTuner
@@ -64,15 +68,26 @@ Alternatively, here is a minimal example to get started:
         ],
         "step": 0
     },
+    "_PACKAGE_PARAM_DEFAULT_STATE": {
+        "type": "choice",
+        "values": [
+            "IDLE",
+            "INIT",
+            "ACTIVE",
+            "ERROR",
+            "SHUTDOWN"
+        ]
+    },
 }
 ```
 
-* `"_SDC_FILE_PATH"`, `"_SDC_CLK_PERIOD"`, `"CORE_MARGIN"`: Parameter names for sweeping/tuning.
-* `"type"`: Parameter type ("float" or "int") for sweeping/tuning
-* `"minmax"`: Min-to-max range for sweeping/tuning. The unit follows the default value of each technology std cell library.
-* `"step"`: Parameter step within the minmax range. Step 0 for type "float" means continuous step for sweeping/tuning. Step 0 for type "int" means the constant parameter.
+* `"_SDC_FILE_PATH"`, `"_SDC_CLK_PERIOD"`, `"CORE_MARGIN", "_PACKAGE_PARAM_DEFAULT_STATE"`: Parameter names for sweeping/tuning.
+* `"type"`: Parameter type ("float", "int" or "choice") for sweeping/tuning
+* `"minmax"`: Min-to-max range for sweeping/tuning. The unit follows the default value of each technology std cell library (only needed for types "float" or "int").
+* `"step"`: Parameter step within the minmax range. Step 0 for type "float" means continuous step for sweeping/tuning (only needed for types "float" or "int"). Step 0 for type "int" means the constant parameter.
+* `"values"`: List of choices (only needed for type `"choice"`).
 
-## Tunable / sweepable parameters
+## Tunable / sweepable parameters (for ORFS)
 
 Tables of parameters that can be swept/tuned in technology platforms supported by ORFS.
 Any variable that can be set from the command line can be used for tune or sweep.
@@ -100,6 +115,13 @@ For Global Routing parameters that are set on `fastroute.tcl` you can use:
 * `_FR_GR_SEED`
   - Global route random seed. This will create a copy of `_FR_FILE_PATH` and modify the global route random seed.
 
+## Defining design parameters and defines
+
+The same configuration file and item format as that for specifying the ORFS parameters is used to specifying the `parameter` and `define` to tune. For the top-level file, prepend the name with `_TOP_PARAM_` and `_TOP_DEF` for parameters and defines, respectively. For the package file, prepend the name with `_PACKAGE_PARAM_` and `_PACKAGE_DEF` for parameters and defines, respectively.
+
+The top-level file to use is specified in the `.json` file with the field  `"_TOP_LEVEL_FILE_PATH"` and the package file is defined specified with the field `"_PACKAGE_FILE_PATH"`. Note that the path must be relative to the location of the `.json`.
+
+
 ## How to use
 
 ### General Information
@@ -119,9 +141,10 @@ parameters. Both modes rely on user-specified search space that is
 defined by a `.json` file, they use the same syntax and format, 
 though some features may not be available for sweeping.
 
+#### Notes
 ```{note}
-The order of the parameters matter. Arguments `--design`, `--platform` and
-`--config` are always required and should precede *mode*.
+* The order of the parameters matter. Arguments `--design`, `--platform` and `--config` are always required and should precede *mode*.
+* The design files must be located in the `OpenRoad-flow-scripts` repo directory. Typically, the configuration files and `.tcl` scripts are located in `flow/designs/<platform>/<design>` and the source files are located in `flow/designs/src/<design>`.
 ```
 
 #### Tune only 
@@ -159,6 +182,7 @@ GCP Setup Tutorial coming soon.
 | `--design`                    | Name of the design for Autotuning.                                                                    ||
 | `--platform`                  | Name of the platform for Autotuning.                                                                  ||
 | `--config`                    | Configuration file that sets which knobs to use for Autotuning.                                       ||
+| `--stage_stop`                | Flow stage at which to stop script. May be one of `["floorplan", "place", "cts", "route", "all"]`     | all |
 | `--experiment`                | Experiment name. This parameter is used to prefix the FLOW_VARIANT and to set the Ray log destination.| test |
 | `--git_clean`                 | Clean binaries and build files. **WARNING**: may lose previous data.                                  ||
 | `--git_clone`                 | Force new git clone. **WARNING**: may lose previous data.                                             ||
@@ -229,4 +253,4 @@ Please cite the following paper.
 
 ## Acknowledgments
 
-AutoTuner has been developed by UCSD with the OpenROAD Project.
+AutoTuner has been developed by UCSD with the OpenROAD Project. Additional features by the Integrated Systems Laboratory (IIS) at ETH Zürich.
