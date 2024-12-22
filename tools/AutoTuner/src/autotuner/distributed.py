@@ -95,6 +95,7 @@ METRICS_MAP = {
                     "num_drc"       : ["detailedroute","route__drc_errors"],
                     "worst_slack"   : ["finish", "timing__setup__ws"]}
 }
+COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 1000, 100, 10
 
 from enum import Enum
 # ----- ENUMS ----- #
@@ -129,27 +130,9 @@ class AutoTunerBase(tune.Trainable):
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
         self.copy_dir = os.getcwd() + f"/{self.variant}"
 
-        # Make list of patterns to ignore when copying the repo to reduce the size of the copy
-        dont_copy = ["logs", "reports", "results", "objects", "docs"]
-        for pattern, directory in [(args.platform, "platforms"), (args.platform, "designs"), (args.design, "designs/src")]:
-            target_dir = f"{ORFS_FLOW_DIR}/{directory}"
-            all_patterns = [d for d in os.listdir(target_dir)
-                            if os.path.isdir(os.path.join(target_dir, d))]
-            other_patterns = [p for p in all_patterns if (p != pattern and p != "src" and p != "common")]
-            dont_copy.extend(other_patterns)
+        copy_repo(self.repo_dir, self.copy_dir, config)
 
-        shutil.copytree(
-            self.repo_dir,
-            self.copy_dir,
-            ignore=shutil.ignore_patterns(*dont_copy)
-        )
-
-        sdc_file_path = f"{self.copy_dir}/{config['sdc_file_path']}"
-        fr_file_path = f"{self.copy_dir}/{config['fr_file_path']}"
-        top_level_file_path = f"{self.copy_dir}/{config['top_level_file_path']}"
-        pkg_file_path = f"{self.copy_dir}/{config['pkg_file_path']}"
-
-        self.parameters = parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_file_path)
+        self.parameters = parse_config(config)
 
     def step(self):
         """
@@ -159,7 +142,6 @@ class AutoTunerBase(tune.Trainable):
         self.step_ += 1
         score = self.evaluate(self.read_metrics(metrics_file))
         # Feed the score back to Tune. return must match 'metric' used in tune.run()
-        print(f"score: {score}")
         return {METRIC: score}
 
     def evaluate(self, metrics):
@@ -211,7 +193,12 @@ class AutoTunerBase(tune.Trainable):
 
 class PPAImprov(AutoTunerBase):
     """
-    PPAImprov
+    Extends AutoTunerBase to improve PPA (Performance, Power, Area) metrics.
+
+    This class overrides the evaluation method to compute a PPA score,
+    which combines performance, power, and area metrics to optimize the design.
+    It uses a reference configuration to compare and compute the improvements.
+    Users are invited to modify the get_ppa function to suit their specific needs.
     """
 
     @classmethod
@@ -219,7 +206,6 @@ class PPAImprov(AutoTunerBase):
         """
         Compute PPA term for evaluate.
         """
-        COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 1000, 100, 10
 
         assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
         assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
@@ -262,6 +248,29 @@ class PPAImprov(AutoTunerBase):
         return score
 
 
+def copy_repo(repo_dir, copy_dir, config):
+    """
+    Makes a local copy of the repo, but discards unnecessary directories (unused platforms and designs, etc).
+    This gives each run a fresh copy of the design file to avoid race conditions.
+    """
+    # Make list of patterns to ignore when copying the repo to reduce the size of the copy
+    dont_copy = ["logs", "reports", "results", "objects", "docs"]
+    for pattern, directory in [(args.platform, "platforms"), (args.platform, "designs"), (args.design, "designs/src")]:
+        target_dir = f"{ORFS_FLOW_DIR}/{directory}"
+        all_patterns = [d for d in os.listdir(target_dir)
+                        if os.path.isdir(os.path.join(target_dir, d))]
+        other_patterns = [p for p in all_patterns if (p != pattern and p != "src" and p != "common")]
+        dont_copy.extend(other_patterns)
+
+    shutil.copytree(repo_dir, copy_dir, ignore=shutil.ignore_patterns(*dont_copy))
+    
+    # Update the file paths in the configuration dictionary
+    config['_SDC_FILE_PATH'] = f"{copy_dir}/{config['_SDC_FILE_PATH']}"
+    config['_FR_FILE_PATH'] = f"{copy_dir}/{config['_FR_FILE_PATH']}"
+    config['_TOP_LEVEL_FILE_PATH'] = f"{copy_dir}/{config['_TOP_LEVEL_FILE_PATH']}"
+    config['_PACKAGE_FILE_PATH'] = f"{copy_dir}/{config['_PACKAGE_FILE_PATH']}"
+
+
 def read_config(file_name):
     """
     Please consider inclusive, exclusive
@@ -271,9 +280,6 @@ def read_config(file_name):
     step value is used for quantized type (e.g., quniform). Otherwise, write 0.
     When min==max, it means the constant value
     """
-
-    def read_sweep(this):
-        return [*this["minmax"], this["step"]]
 
     def apply_condition(config, data):
         # TODO: tune.sample_from only supports random search algorithm.
@@ -372,10 +378,7 @@ def read_config(file_name):
             data = json.load(file)
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON file: {file_name}")
-    sdc_file = ""
-    fr_file = ""
-    top_level_file = ""
-    pkg_file = ""
+
     if args.mode == "tune" and args.algorithm == "ax":
         config = list()
     else:
@@ -383,32 +386,15 @@ def read_config(file_name):
     for key, value in data.items():
         if key == "best_result":
             continue
-        if key == "_TOP_LEVEL_FILE_PATH" and value != "":
-            if top_level_file != "":
-                print("[WARNING TUN-0004] Obtained more than one file path for the top-level file.")
+
+        if "_FILE_PATH" in key and value != "":
+            if key in config.keys():
+                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
             full_path = f"{os.path.dirname(file_name)}/{value}"
-            top_level_file = full_path.split("OpenROAD-flow-scripts/")[1]
+            config[key] = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
-        if key == "_PACKGAGE_FILE_PATH" and value != "":
-            if pkg_file != "":
-                print("[WARNING TUN-0004] Obtained more than one file path for the package file.")
-            full_path = f"{os.path.dirname(file_name)}/{value}"
-            pkg_file = full_path.split("OpenROAD-flow-scripts/")[1]
-            continue
-        if key == "_SDC_FILE_PATH" and value != "":
-            if sdc_file != "":
-                print("[WARNING TUN-0004] Obtained more than one file path for the SDC file.")
-            full_path = f"{os.path.dirname(file_name)}/{value}"
-            sdc_file = full_path.split("OpenROAD-flow-scripts/")[1]
-            continue
-        if key == "_FR_FILE_PATH" and value != "":
-            if fr_file != "":
-                print("[WARNING TUN-0005] Obtained more than one file path for the FastRoute file.")
-            full_path = f"{os.path.dirname(file_name)}/{value}"
-            fr_file = full_path.split("OpenROAD-flow-scripts/")[1]
-            continue
+
         if not isinstance(value, dict):
-            # To take care of empty values like _FR_FILE_PATH
             if args.mode == "tune" and args.algorithm == "ax":
                 param_dict = read_tune_ax(key, value)
                 if param_dict:
@@ -420,7 +406,7 @@ def read_config(file_name):
             else:
                 config[key] = value
         elif args.mode == "sweep":
-            config[key] = read_sweep(value)
+            config[key] = value
         elif args.mode == "tune" and args.algorithm == "ax":
             config.append(read_tune_ax(key, value))
         elif args.mode == "tune" and args.algorithm == "pbt":
@@ -430,11 +416,11 @@ def read_config(file_name):
     if args.mode == "tune":
         config = apply_condition(config, data)
 
-    if top_level_file == "":
+    if config["_TOP_LEVEL_FILE_PATH"] == "":
         print("WARNING: No top-level file provided.")
-    if pkg_file == "":
+    if config["_PACKAGE_FILE_PATH"] == "":
         print("WARNING: No package file provided.")
-    return config, sdc_file, fr_file, top_level_file, pkg_file
+    return config
 
 
 def parse_flow_variables():
@@ -476,15 +462,17 @@ def parse_flow_variables():
     return variables
 
 
-def parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_file_path):
+def parse_config(config):
     """
     Parse configuration received from tune into make variables.
     """
     options = ""
     sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
-    verilog_rewriter = VerilogRewriter(top_fp=top_level_file_path, pkg_fp=pkg_file_path)
+    verilog_rewriter = VerilogRewriter(top_fp=config["_TOP_LEVEL_FILE_PATH"], pkg_fp=config["_PACKAGE_FILE_PATH"])
     for key, value in config.items():
+        if "FILE_PATH" in key: # Skip file paths
+            continue
         # Keys that begin with underscore need special handling.
         if key.startswith("_"):
             # Variables to be injected into fastroute.tcl
@@ -521,11 +509,11 @@ def parse_config(config, sdc_file_path, fr_file_path, top_level_file_path, pkg_f
             options += f" {key}={value}"
 
     if bool(sdc):
-        write_sdc(sdc, sdc_file_path)
-        options += f" SDC_FILE={sdc_file_path}"
+        write_sdc(sdc, config["_SDC_FILE_PATH"])
+        options += f" SDC_FILE={config['_SDC_FILE_PATH']}"
     if bool(fast_route):
-        write_fast_route(fast_route, fr_file_path)
-        options += f" FASTROUTE_TCL={fr_file_path}"
+        write_fast_route(fast_route, config["_FR_FILE_PATH"])
+        options += f" FASTROUTE_TCL={config['_FR_FILE_PATH']}"
     if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
         verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
     return options
@@ -630,25 +618,25 @@ def run_command(cmd, timeout=None, stderr_file=None, stdout_file=None, fail_fast
 
 
 @ray.remote
-def openroad_distributed(repo_dir, config, path):
+def openroad_distributed(repo_dir, base_log_dir, config):
     """Simple wrapper to run openroad distributed with Ray."""
+    copy_dir = base_log_dir + f"/variant-{uuid()}"
+    copy_repo(repo_dir, copy_dir, config)
     config = parse_config(config)
-    openroad(repo_dir, config, str(uuid()), path=path)
+    os.chdir(copy_dir)
+    openroad(copy_dir, config, str(uuid()))
 
 
-def openroad(base_dir, parameters, flow_variant, path=""):
+def openroad(base_dir, parameters, flow_variant):#, path=""):
     """
     Run OpenROAD-flow-scripts with a given set of parameters.
     """
     # Make sure path ends in a slash, i.e., is a folder
     flow_variant = f"{args.experiment}/{flow_variant}"
-    if path != "":
-        log_path = f"{path}/{flow_variant}/"
-        report_path = log_path.replace("logs", "reports")
-        run_command(f"mkdir -p {log_path}")
-        run_command(f"mkdir -p {report_path}")
-    else:
-        log_path = report_path = os.getcwd() + "/"
+    log_path = os.getcwd() + "/"
+    report_path = log_path.replace("logs", "reports")
+    run_command(f"mkdir -p {log_path}")
+    run_command(f"mkdir -p {report_path}")
 
     export_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
     export_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
@@ -969,7 +957,7 @@ def parse_arguments():
     if arguments.timeout is not None:
         arguments.timeout = round(arguments.timeout * 3600)
 
-    if (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
+    if (arguments.mode == "tune") and (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
         print(f"Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
 
     return arguments
@@ -1078,10 +1066,10 @@ def consumer(queue):
     """consumer"""
     while not queue.empty():
         next_item = queue.get()
-        name = next_item[1]
-        print(f"[INFO TUN-0007] Scheduling run for parameter {name}.")
+        params = next_item[2]
+        print(f"[INFO TUN-0007] Scheduling run for parameters {params}.")
         ray.get(openroad_distributed.remote(*next_item))
-        print(f"[INFO TUN-0008] Finished run for parameter {name}.")
+        print(f"[INFO TUN-0008] Finished run for parameters {params}.")
 
 
 def sweep():
@@ -1093,24 +1081,43 @@ def sweep():
         repo_dir = os.path.abspath(BASE_LOCAL_DIR + "/../" * 4)
     else:
         repo_dir = os.path.abspath("../")
-    print(f"[INFO TUN-0012] Log folder {BASE_LOCAL_DIR}.")
+        log_dir = os.path.join(BASE_LOCAL_DIR, f"sweep-{DATE}")
+
+    print(f"[INFO TUN-0012] Log folder {log_dir}.")
+    os.makedirs(log_dir, exist_ok=True)
+
     queue = Queue()
     parameter_list = list()
+
     for name, content in config_dict.items():
-        if not isinstance(content, list):
-            print(f"[ERROR TUN-0015] {name} sweep is not supported.")
-            sys.exit(1)
-        if content[-1] == 0:
-            print(f"[ERROR TUN-0014] Sweep does not support step value zero.")
-            sys.exit(1)
-        parameter_list.append([{name: i} for i in np.arange(*content)])
+        if "_FILE_PATH" in name: # Ignore file paths
+            continue
+
+        if content["type"] == "choice":
+            parameter_list.append([{name: i} for i in content["values"]])
+        else:
+            if content["step"] == 0:
+                print(f"[ERROR TUN-0014] Sweep does not support step value zero.")
+                sys.exit(1)
+            if (content["minmax"][0] == content["minmax"][1]):
+                parameter_list.append([{name: content["minmax"][0]}])
+            else:
+                parameter_list.append([{name: i} for i in np.arange(start=content["minmax"][0],
+                                                                    stop=content["minmax"][1] + content["step"],
+                                                                    step=content["step"])])
+
     parameter_list = list(product(*parameter_list))
+
     for parameter in parameter_list:
-        temp = dict()
+        run_params = dict()
+        run_params["_TOP_LEVEL_FILE_PATH"] = config_dict["_TOP_LEVEL_FILE_PATH"]
+        run_params["_PACKAGE_FILE_PATH"] = config_dict["_PACKAGE_FILE_PATH"]
+        run_params["_FR_FILE_PATH"] = config_dict["_FR_FILE_PATH"]
+        run_params["_SDC_FILE_PATH"] = config_dict["_SDC_FILE_PATH"]
         for value in parameter:
-            temp.update(value)
-        print(temp)
-        queue.put([repo_dir, temp, BASE_LOCAL_DIR])
+            run_params.update(value)
+        queue.put([repo_dir, log_dir, run_params])
+
     workers = [consumer.remote(queue) for _ in range(args.jobs)]
     print("[INFO TUN-0009] Waiting for results.")
     ray.get(workers)
@@ -1122,7 +1129,7 @@ if __name__ == "__main__":
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
-    config_dict, sdc_file_rel, fr_file_rel, top_level_file_rel, pkg_file_rel = read_config(os.path.abspath(args.config))
+    config_dict = read_config(os.path.abspath(args.config))
 
     # Connect to remote Ray server if any, otherwise will run locally
     # TODO: Fix directory structure for server runs.
@@ -1163,12 +1170,6 @@ if __name__ == "__main__":
         if args.eval == "ppa-improv":
             reference = PPAImprov.read_metrics(args.reference)
 
-        config_dict.update({
-            "sdc_file_path": sdc_file_rel,
-            "fr_file_path": fr_file_rel,
-            "top_level_file_path": top_level_file_rel,
-            "pkg_file_path": pkg_file_rel
-        })
         tune_args = dict(
             name=args.experiment,
             metric=METRIC,
@@ -1191,6 +1192,7 @@ if __name__ == "__main__":
             tune_args["scheduler"] = AsyncHyperBandScheduler()
         if args.algorithm != "ax":
             tune_args["config"] = config_dict
+
         analysis = tune.run(TrainClass, **tune_args)
 
         task_id = save_best.remote(analysis)
