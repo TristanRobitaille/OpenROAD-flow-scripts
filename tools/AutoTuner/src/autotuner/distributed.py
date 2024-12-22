@@ -56,7 +56,7 @@ from ray.util.queue import Queue
 
 from ax.service.ax_client import AxClient
 
-from Rewriter import VerilogRewriter
+from VerilogRewriter import VerilogRewriter
 
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
