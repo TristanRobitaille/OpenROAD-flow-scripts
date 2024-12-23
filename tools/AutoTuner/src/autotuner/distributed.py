@@ -267,8 +267,10 @@ def copy_repo(repo_dir, copy_dir, config):
     # Update the file paths in the configuration dictionary
     config['_SDC_FILE_PATH'] = f"{copy_dir}/{config['_SDC_FILE_PATH']}"
     config['_FR_FILE_PATH'] = f"{copy_dir}/{config['_FR_FILE_PATH']}"
-    config['_TOP_LEVEL_FILE_PATH'] = f"{copy_dir}/{config['_TOP_LEVEL_FILE_PATH']}"
-    config['_PACKAGE_FILE_PATH'] = f"{copy_dir}/{config['_PACKAGE_FILE_PATH']}"
+    if "_TOP_LEVEL_FILE_PATH" in config.keys():
+        config["_TOP_LEVEL_FILE_PATH"] = f"{copy_dir}/{config['_TOP_LEVEL_FILE_PATH']}"
+    if "_PACKAGE_FILE_PATH" in config.keys():
+        config["_PACKAGE_FILE_PATH"] = f"{copy_dir}/{config['_PACKAGE_FILE_PATH']}"
 
 
 def read_config(file_name):
@@ -416,9 +418,9 @@ def read_config(file_name):
     if args.mode == "tune":
         config = apply_condition(config, data)
 
-    if config["_TOP_LEVEL_FILE_PATH"] == "":
+    if "_TOP_LEVEL_FILE_PATH" not in config.keys():
         print("WARNING: No top-level file provided.")
-    if config["_PACKAGE_FILE_PATH"] == "":
+    if "_PACKAGE_FILE_PATH" not in config.keys():
         print("WARNING: No package file provided.")
     return config
 
@@ -469,7 +471,8 @@ def parse_config(config):
     options = ""
     sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
-    verilog_rewriter = VerilogRewriter(top_fp=config["_TOP_LEVEL_FILE_PATH"], pkg_fp=config["_PACKAGE_FILE_PATH"])
+    if "_TOP_LEVEL_FILE_PATH" in config.keys() and "_PACKAGE_FILE_PATH" in config.keys():
+        verilog_rewriter = VerilogRewriter(top_fp=config["_TOP_LEVEL_FILE_PATH"], pkg_fp=config["_PACKAGE_FILE_PATH"])
     for key, value in config.items():
         if "FILE_PATH" in key: # Skip file paths
             continue
@@ -524,11 +527,15 @@ def write_sdc(variables, sdc_file_path):
     Create a SDC file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist
+    if not os.path.isfile(sdc_file_path):
+        print("[ERROR TUN-0020] No SDC reference file provided.")
+        sys.exit(1)
+
     with open(sdc_file_path, "r") as file:
         sdc_content = file.read()
 
     if sdc_content == "":
-        print("[ERROR TUN-0020] No SDC reference file provided.")
+        print("[ERROR TUN-0020] SDC reference file provided is empty.")
         sys.exit(1)
     for key, value in variables.items():
         if key == "CLK_PERIOD":
@@ -566,11 +573,14 @@ def write_fast_route(variables, fr_file_path):
     Create a FastRoute Tcl file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist (asap7 doesn't have reference)
+    if not os.path.isfile(fr_file_path):
+        print("[ERROR TUN-0020] No FastRoute Tcl reference file provided.")
+        sys.exit(1)
     with open(fr_file_path, "r") as file:
         fr_content = file.read()
 
     if fr_content == "" and args.platform != "asap7":
-        print("[ERROR TUN-0021] No FastRoute Tcl reference file provided.")
+        print("[ERROR TUN-0021] FastRoute Tcl reference file provided is empty.")
         sys.exit(1)
     layer_cmd = "set_global_routing_layer_adjustment"
     for key, value in variables.items():
