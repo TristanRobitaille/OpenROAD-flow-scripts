@@ -33,6 +33,7 @@ import sys
 import glob
 import subprocess
 import random
+from copy import deepcopy
 from datetime import datetime
 from multiprocessing import cpu_count
 from subprocess import run
@@ -62,6 +63,7 @@ DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 FASTROUTE_TCL = "fastroute.tcl"
 CONSTRAINTS_SDC = "constraint.sdc"
+JSON_FILES_BASE = dict() # Base path for files defined in the .json file
 METRIC = "minimum"
 ERROR_METRIC = 9e99
 ORFS_FLOW_DIR = os.path.abspath(
@@ -118,7 +120,7 @@ class AutoTunerBase(tune.Trainable):
         setting up configuration parameters for the experiment.
 
         Parameters:
-        - config (dict): Configuration parameters including file paths.
+        - config (dict): Hyperparameters, parameters and defines for this run.
         """
 
         # We create the following directory structure:
@@ -130,9 +132,9 @@ class AutoTunerBase(tune.Trainable):
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
         self.copy_dir = os.getcwd() + f"/{self.variant}"
 
-        copy_repo(self.repo_dir, self.copy_dir, config)
+        files = copy_repo(self.repo_dir, self.copy_dir)
 
-        self.parameters = parse_config(config)
+        self.parameters = parse_config(config, files)
 
     def step(self):
         """
@@ -248,7 +250,7 @@ class PPAImprov(AutoTunerBase):
         return score
 
 
-def copy_repo(repo_dir, copy_dir, config):
+def copy_repo(repo_dir, copy_dir):
     """
     Makes a local copy of the repo, but discards unnecessary directories (unused platforms and designs, etc).
     This gives each run a fresh copy of the design file to avoid race conditions.
@@ -263,14 +265,17 @@ def copy_repo(repo_dir, copy_dir, config):
         dont_copy.extend(other_patterns)
 
     shutil.copytree(repo_dir, copy_dir, ignore=shutil.ignore_patterns(*dont_copy))
-    
+
     # Update the file paths in the configuration dictionary
-    config['_SDC_FILE_PATH'] = f"{copy_dir}/{config['_SDC_FILE_PATH']}"
-    config['_FR_FILE_PATH'] = f"{copy_dir}/{config['_FR_FILE_PATH']}"
-    if "_TOP_LEVEL_FILE_PATH" in config.keys():
-        config["_TOP_LEVEL_FILE_PATH"] = f"{copy_dir}/{config['_TOP_LEVEL_FILE_PATH']}"
-    if "_PACKAGE_FILE_PATH" in config.keys():
-        config["_PACKAGE_FILE_PATH"] = f"{copy_dir}/{config['_PACKAGE_FILE_PATH']}"
+    files = deepcopy(JSON_FILES_BASE)
+    files["_SDC_FILE_PATH"] = f"{copy_dir}/{files['_SDC_FILE_PATH']}"
+    files["_FR_FILE_PATH"] = f"{copy_dir}/{files['_FR_FILE_PATH']}"
+    if "_TOP_LEVEL_FILE_PATH" in files.keys():
+        files["_TOP_LEVEL_FILE_PATH"] = f"{copy_dir}/{files['_TOP_LEVEL_FILE_PATH']}"
+    if "_PACKAGE_FILE_PATH" in files.keys():
+        files["_PACKAGE_FILE_PATH"] = f"{copy_dir}/{files['_PACKAGE_FILE_PATH']}"
+    
+    return files
 
 
 def read_config(file_name):
@@ -385,15 +390,20 @@ def read_config(file_name):
         config = list()
     else:
         config = dict()
+
+    top_param_or_def_found, package_param_or_def_found = False, False
     for key, value in data.items():
         if key == "best_result":
             continue
 
+        top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
+        package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
+
         if "_FILE_PATH" in key and value != "":
-            if key in config.keys():
+            if key in JSON_FILES_BASE.keys():
                 print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
             full_path = f"{os.path.dirname(file_name)}/{value}"
-            config[key] = full_path.split("OpenROAD-flow-scripts/")[1]
+            JSON_FILES_BASE[key] = full_path.split("OpenROAD-flow-scripts/")[1]
             continue
 
         if not isinstance(value, dict):
@@ -415,13 +425,17 @@ def read_config(file_name):
             config[key] = read_tune(value)
         elif args.mode == "tune":
             config[key] = read_tune(value)
+
     if args.mode == "tune":
         config = apply_condition(config, data)
+    
+    if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
+        print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
+        sys.exit(1)
+    if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
+        print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
+        sys.exit(1)
 
-    if "_TOP_LEVEL_FILE_PATH" not in config.keys():
-        print("WARNING: No top-level file provided.")
-    if "_PACKAGE_FILE_PATH" not in config.keys():
-        print("WARNING: No package file provided.")
     return config
 
 
@@ -464,18 +478,16 @@ def parse_flow_variables():
     return variables
 
 
-def parse_config(config):
+def parse_config(config, files):
     """
     Parse configuration received from tune into make variables.
     """
     options = ""
     sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
-    if "_TOP_LEVEL_FILE_PATH" in config.keys() and "_PACKAGE_FILE_PATH" in config.keys():
-        verilog_rewriter = VerilogRewriter(top_fp=config["_TOP_LEVEL_FILE_PATH"], pkg_fp=config["_PACKAGE_FILE_PATH"])
+    if "_TOP_LEVEL_FILE_PATH" in files.keys() and "_PACKAGE_FILE_PATH" in files.keys():
+        verilog_rewriter = VerilogRewriter(top_fp=files["_TOP_LEVEL_FILE_PATH"], pkg_fp=files["_PACKAGE_FILE_PATH"])
     for key, value in config.items():
-        if "FILE_PATH" in key: # Skip file paths
-            continue
         # Keys that begin with underscore need special handling.
         if key.startswith("_"):
             # Variables to be injected into fastroute.tcl
@@ -512,11 +524,11 @@ def parse_config(config):
             options += f" {key}={value}"
 
     if bool(sdc):
-        write_sdc(sdc, config["_SDC_FILE_PATH"])
-        options += f" SDC_FILE={config['_SDC_FILE_PATH']}"
+        write_sdc(sdc, files["_SDC_FILE_PATH"])
+        options += f" SDC_FILE={files['_SDC_FILE_PATH']}"
     if bool(fast_route):
-        write_fast_route(fast_route, config["_FR_FILE_PATH"])
-        options += f" FASTROUTE_TCL={config['_FR_FILE_PATH']}"
+        write_fast_route(fast_route, files["_FR_FILE_PATH"])
+        options += f" FASTROUTE_TCL={files['_FR_FILE_PATH']}"
     if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
         verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
     return options
@@ -631,13 +643,13 @@ def run_command(cmd, timeout=None, stderr_file=None, stdout_file=None, fail_fast
 def openroad_distributed(repo_dir, base_log_dir, config):
     """Simple wrapper to run openroad distributed with Ray."""
     copy_dir = base_log_dir + f"/variant-{uuid()}"
-    copy_repo(repo_dir, copy_dir, config)
-    config = parse_config(config)
+    files = copy_repo(repo_dir, copy_dir)
+    config = parse_config(config, files)
     os.chdir(copy_dir)
     openroad(copy_dir, config, str(uuid()))
 
 
-def openroad(base_dir, parameters, flow_variant):#, path=""):
+def openroad(base_dir, parameters, flow_variant):
     """
     Run OpenROAD-flow-scripts with a given set of parameters.
     """
@@ -1100,9 +1112,6 @@ def sweep():
     parameter_list = list()
 
     for name, content in config_dict.items():
-        if "_FILE_PATH" in name: # Ignore file paths
-            continue
-
         if content["type"] == "choice":
             parameter_list.append([{name: i} for i in content["values"]])
         else:
@@ -1120,10 +1129,6 @@ def sweep():
 
     for parameter in parameter_list:
         run_params = dict()
-        run_params["_TOP_LEVEL_FILE_PATH"] = config_dict["_TOP_LEVEL_FILE_PATH"]
-        run_params["_PACKAGE_FILE_PATH"] = config_dict["_PACKAGE_FILE_PATH"]
-        run_params["_FR_FILE_PATH"] = config_dict["_FR_FILE_PATH"]
-        run_params["_SDC_FILE_PATH"] = config_dict["_SDC_FILE_PATH"]
         for value in parameter:
             run_params.update(value)
         queue.put([repo_dir, log_dir, run_params])
