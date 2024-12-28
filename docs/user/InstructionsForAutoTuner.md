@@ -45,43 +45,85 @@ Make sure you run the following commands in the ORFS root directory.
 
 ## Input JSON structure
 
-Sample JSON [file](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/designs/sky130hd/aes/autotuner.json) for Sky130HD `aes` design:  
+Sample JSON [file](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/designs/sky130hd/aes/autotuner.json) for Sky130HD `aes` design:
 
 Alternatively, here is a minimal example to get started:
 
 ```json
 {
-    "_SDC_FILE_PATH": "constraint.sdc",
-    "_SDC_CLK_PERIOD": {
-        "type": "float",
-        "minmax": [
-            1.0,
-            3.7439
-        ],
-        "step": 0
+    "parameters" : {
+        "_TOP_PARAM_coef_width": {
+            "type": "int",
+            "minmax": [
+                2,
+                16
+            ],
+            "step": 1
+        },
+        "_PACKAGE_PARAM_ADDR_WIDTH": {
+            "type": "int",
+            "minmax": [
+                8,
+                16
+            ],
+            "step": 2
+        },
+        "_PACKAGE_DEF_CLOCK_FREQUENCY": {
+            "type": "int",
+            "minmax": [
+                500000000,
+                1000000000
+            ],
+            "step": 100000000
+        },
+        "_PACKAGE_PARAM_DEFAULT_STATE": {
+            "type": "choice",
+            "values": [
+                "IDLE",
+                "INIT",
+                "ACTIVE",
+                "ERROR",
+                "SHUTDOWN"
+            ]
+        },
+        "_SDC_CLK_PERIOD": {
+            "type": "float",
+            "minmax": [
+                7.0,
+                9.0
+            ],
+            "step": 0
+        },
+        "CORE_UTILIZATION": {
+            "type": "int",
+            "minmax": [
+                20,
+                50
+            ],
+            "step": 1
+        }
     },
-    "CORE_MARGIN": {
-        "type": "int",
-        "minmax": [
-            2,
-            2
-        ],
-        "step": 0
+    "files" : {
+        "_SDC_FILE_PATH": "constraint.sdc",
+        "_FR_FILE_PATH": "fastroute.tcl",
+        "_TOP_LEVEL_FILE_PATH": "../../src/jpeg/jpeg_encoder.v",
+        "_PACKAGE_FILE_PATH": "../../src/jpeg/jpeg_pkg.sv"
     },
-    "_PACKAGE_PARAM_DEFAULT_STATE": {
-        "type": "choice",
-        "values": [
-            "IDLE",
-            "INIT",
-            "ACTIVE",
-            "ERROR",
-            "SHUTDOWN"
-        ]
-    },
+    "score_metrics_config" : {
+        "performance" : {
+            "coeff": 10.5
+        },
+        "power" : {
+            "coeff": 2
+        },
+        "area" : {
+            "coeff": 1
+        }
+    }
 }
 ```
 
-* `"_SDC_FILE_PATH"`, `"_SDC_CLK_PERIOD"`, `"CORE_MARGIN", "_PACKAGE_PARAM_DEFAULT_STATE"`: Parameter names for sweeping/tuning.
+* `"_TOP_PARAM_coef_width"`, `"_PACKAGE_PARAM_ADDR_WIDTH"`, `"_PACKAGE_DEF_CLOCK_FREQUENCY"`, `"_PACKAGE_PARAM_DEFAULT_STATE"`, `"_SDC_CLK_PERIOD"`, `"CORE_UTILIZATION"`: Parameter names for sweeping/tuning.
 * `"type"`: Parameter type ("float", "int" or "choice") for sweeping/tuning
 * `"minmax"`: Min-to-max range for sweeping/tuning. The unit follows the default value of each technology std cell library (only needed for types "float" or "int").
 * `"step"`: Parameter step within the minmax range. Step 0 for type "float" means continuous step for sweeping/tuning (only needed for types "float" or "int"). Step 0 for type "int" means the constant parameter.
@@ -121,13 +163,16 @@ The same configuration file and item format as that for specifying the ORFS para
 
 The top-level file to use is specified in the `.json` file with the field  `"_TOP_LEVEL_FILE_PATH"` and the package file is defined specified with the field `"_PACKAGE_FILE_PATH"`. Note that the path must be relative to the location of the `.json`.
 
+## Defining metrics used to compute the score of a run
+
+The user can define their metrics used to compute the score of a run. The metrics are defined in the configuration `.json` and the function to compute the score is defined in the `PPAImprov.get_score()` method. By default, the PPA is computed using the coefficients shown in the above JSON snippet.
 
 ## How to use
 
 ### General Information
 
 The `distributed.py` script located in `./tools/AutoTuner/src/autotuner` uses [Ray's](https://docs.ray.io/en/latest/index.html) job scheduling and management to
-fully utilize available hardware resources from a single server 
+fully utilize available hardware resources from a single server
 configuration, on-premise or over the cloud with multiple CPUs.
 
 The two modes of operation:
@@ -136,9 +181,9 @@ The two modes of operation:
 
 The `sweep` mode is useful when we want to isolate or test a single or very few
 parameters. On the other hand, `tune` is more suitable for finding
-the best combination of a complex and large number of flow 
-parameters. Both modes rely on user-specified search space that is 
-defined by a `.json` file, they use the same syntax and format, 
+the best combination of a complex and large number of flow
+parameters. Both modes rely on user-specified search space that is
+defined by a `.json` file, they use the same syntax and format,
 though some features may not be available for sweeping.
 
 #### Notes
@@ -147,7 +192,7 @@ though some features may not be available for sweeping.
 * The design files must be located in the `OpenRoad-flow-scripts` repo directory. Typically, the configuration files and `.tcl` scripts are located in `flow/designs/<platform>/<design>` and the source files are located in `flow/designs/src/<design>`.
 ```
 
-#### Tune only 
+#### Tune only
 
 * AutoTuner: `python3 distributed.py tune -h`
 
@@ -158,7 +203,7 @@ python3 distributed.py --design gcd --platform sky130hd \
                        --config ../../../../flow/designs/sky130hd/gcd/autotuner.json \
                        tune --samples 5
 ```
-#### Sweep only 
+#### Sweep only
 
 * Parameter sweeping: `python3 distributed.py sweep -h`
 
