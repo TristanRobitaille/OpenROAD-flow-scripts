@@ -1,5 +1,46 @@
 {
-    "_SDC_FILE_PATH": "constraint.sdc",
+    "_TOP_PARAM_coef_width": {
+        "type": "int",
+        "minmax": [
+            2,
+            16
+        ],
+        "step": 1
+    },
+    "_TOP_PARAM_di_width": {
+        "type": "int",
+        "minmax": [
+            8,
+            128
+        ],
+        "step": 4
+    },
+    "_PACKAGE_PARAM_ADDR_WIDTH": {
+        "type": "int",
+        "minmax": [
+            8,
+            16
+        ],
+        "step": 2
+    },
+    "_PACKAGE_DEF_CLOCK_FREQUENCY": {
+        "type": "int",
+        "minmax": [
+            500000000,
+            1000000000
+        ],
+        "step": 100000000
+    },
+    "_PACKAGE_PARAM_DEFAULT_STATE": {
+        "type": "choice",
+        "values": [
+            "IDLE",
+            "INIT",
+            "ACTIVE",
+            "ERROR",
+            "SHUTDOWN"
+        ]
+    },
     "_SDC_CLK_PERIOD": {
         "type": "float",
         "minmax": [
@@ -88,7 +129,10 @@
         ],
         "step": 1
     },
+    "_SDC_FILE_PATH": "constraint.sdc",
     "_FR_FILE_PATH": "fastroute.tcl",
+    "_TOP_LEVEL_FILE_PATH": "../../src/jpeg/jpeg_encoder.v",
+    "_PACKAGE_FILE_PATH": "../../src/jpeg/jpeg_pkg.sv",
     "_FR_GR_OVERFLOW": {
         "type": "int",
         "minmax": [

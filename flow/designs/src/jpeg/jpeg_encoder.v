@@ -1,13 +1,11 @@
 /////////////////////////////////////////////////////////////////////
 ////                                                             ////
 ////  JPEG Encoder Unit                                          ////
-////                                                             ////
-////  Author: Richard Herveille                                  ////
+////  Author: Richard Herveille     	                         ////
 ////          richard@asics.ws                                   ////
 ////          www.asics.ws                                       ////
 ////                                                             ////
 /////////////////////////////////////////////////////////////////////
-////                                                             ////
 //// Copyright (C) 2002 Richard Herveille                        ////
 ////                    richard@asics.ws                         ////
 ////                                                             ////
@@ -124,7 +122,7 @@ module jpeg_encoder(
 	//                                                                //
 	////////////////////////////////////////////////////////////////////
 
-	parameter coef_width = 11;
+	parameter coef_width = 8;
 	parameter di_width = 8; // no function yet
 
 	//
