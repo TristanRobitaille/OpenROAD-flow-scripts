@@ -274,7 +274,7 @@ def copy_repo(repo_dir, copy_dir):
         files["_TOP_LEVEL_FILE_PATH"] = f"{copy_dir}/{files['_TOP_LEVEL_FILE_PATH']}"
     if "_PACKAGE_FILE_PATH" in files.keys():
         files["_PACKAGE_FILE_PATH"] = f"{copy_dir}/{files['_PACKAGE_FILE_PATH']}"
-    
+
     return files
 
 
@@ -391,15 +391,17 @@ def read_config(file_name):
     else:
         config = dict()
 
-    top_param_or_def_found, package_param_or_def_found = False, False
+    top_param_or_def_found, package_param_or_def_found, sdc_file_found, fr_file_found = False, False, False, False
     for key, value in data.items():
         if key == "best_result":
             continue
 
-        top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
-        package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
-
         if "_FILE_PATH" in key and value != "":
+            top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
+            package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
+            sdc_file_found = (key == "_SDC_FILE_PATH") or sdc_file_found
+            fr_file_found = (key == "_FR_FILE_PATH") or fr_file_found
+
             if key in JSON_FILES_BASE.keys():
                 print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
             full_path = f"{os.path.dirname(file_name)}/{value}"
@@ -428,12 +430,20 @@ def read_config(file_name):
 
     if args.mode == "tune":
         config = apply_condition(config, data)
-    
+
     if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
         print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
         sys.exit(1)
     if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
         print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
+        sys.exit(1)
+
+    if not sdc_file_found:
+        print(f"[ERROR TUN-0020] SDC file is missing in JSON configuration file.")
+        sys.exit(1)
+
+    if not fr_file_found:
+        print(f"[ERROR TUN-0020] FR file is missing in JSON configuration file.")
         sys.exit(1)
 
     return config
