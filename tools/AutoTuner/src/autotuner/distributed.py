@@ -64,6 +64,7 @@ ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 FASTROUTE_TCL = "fastroute.tcl"
 CONSTRAINTS_SDC = "constraint.sdc"
 JSON_FILES_BASE = dict() # Base path for files defined in the .json file
+METRICS_CONFIG = dict() # Configuration for the metrics used to compute the score for each run
 METRIC = "minimum"
 ERROR_METRIC = 9e99
 ORFS_FLOW_DIR = os.path.abspath(
@@ -97,7 +98,6 @@ METRICS_MAP = {
                     "num_drc"       : ["detailedroute","route__drc_errors"],
                     "worst_slack"   : ["finish", "timing__setup__ws"]}
 }
-COEFF_PERFORM, COEFF_POWER, COEFF_AREA = 1000, 100, 10
 
 from enum import Enum
 # ----- ENUMS ----- #
@@ -200,11 +200,11 @@ class PPAImprov(AutoTunerBase):
     This class overrides the evaluation method to compute a PPA score,
     which combines performance, power, and area metrics to optimize the design.
     It uses a reference configuration to compare and compute the improvements.
-    Users are invited to modify the get_ppa function to suit their specific needs.
+    Users are invited to modify the get_score function to suit their specific needs.
     """
 
     @classmethod
-    def get_ppa(cls, metrics):
+    def get_score(cls, metrics):
         """
         Compute PPA term for evaluate.
         """
@@ -224,16 +224,19 @@ class PPAImprov(AutoTunerBase):
         def percent(x_1, x_2):
             return (x_1 - x_2) / x_1 * 100
 
-        performance = percent(eff_clk_period_ref, eff_clk_period)
-        power = percent(reference["total_power"], metrics["total_power"])
-        area = percent(100 - reference["core_util"], 100 - metrics["core_util"])
+        collected_metrics = {
+            "performance": percent(eff_clk_period_ref, eff_clk_period),
+            "power": percent(reference["total_power"], metrics["total_power"]),
+            "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
+        }
 
         # Lower values of PPA are better.
-        ppa_upper_bound = (COEFF_PERFORM + COEFF_POWER + COEFF_AREA) * 100
-        ppa = performance * COEFF_PERFORM
-        ppa += power * COEFF_POWER
-        ppa += area * COEFF_AREA
-        return ppa_upper_bound - ppa
+        score_upper_bound, score = 0, 0
+        for metric_name, metric_data in METRICS_CONFIG.items():
+            score_upper_bound += (100 * metric_data["coeff"])
+            score += (metric_data["coeff"] * collected_metrics[metric_name])
+
+        return (score_upper_bound - score)
 
     def evaluate(self, metrics):
         expected_metrics = METRICS_MAP[args.stage_stop].keys()
@@ -241,7 +244,7 @@ class PPAImprov(AutoTunerBase):
             if metrics[metric] == "N/A" or reference[metric] == "N/A":
                 return ERROR_METRIC
 
-        ppa = self.get_ppa(metrics)
+        ppa = self.get_score(metrics)
         score = ppa * (self.step_ / 100) ** (-1)
         if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
             gamma = ppa / 10
@@ -378,6 +381,105 @@ def read_config(file_name):
             dict_["value_type"] = "float"
         return dict_
 
+    def parse_filepaths(json_config):
+        """
+        Parse file paths from JSON configuration file.
+        """
+        if "files" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Files group is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if "_SDC_FILE_PATH" not in json_config["files"].keys():
+            print(f"[ERROR TUN-0020] SDC file (key '_SDC_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if "_FR_FILE_PATH" not in json_config["files"].keys():
+            print(f"[ERROR TUN-0020] FR file (key '_FR_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
+        for key, filepath in json_config["files"].items():
+            if "_FILE_PATH" not in key:
+                print(f"[WARNING TUN-xxx] Field {key} isn't valid for group 'files'. Ignoring it.")
+                continue
+
+            if filepath == "":
+                print(f"[WARNING TUN-xxx] Value for key {key} in the 'files' group is blank. Ignoring it.")
+                continue
+
+            if key in JSON_FILES_BASE.keys():
+                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+
+            full_path = f"{os.path.dirname(file_name)}/{filepath}"
+            JSON_FILES_BASE[key] = full_path.split("OpenROAD-flow-scripts/")[1]
+
+    def parse_metrics(json_config):
+        """
+        Parse metrics from JSON configuration file.
+        """
+        if "score_metrics" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Metrics group is missing in JSON configuration file.")
+            sys.exit(1)
+
+        for metric_name, metric_config in json_config["score_metrics"].items():
+            if metric_config is None:
+                print(f"[WARNING TUN-0005] Metric {metric_name} has no configuration. Ignoring it.")
+                continue
+            METRICS_CONFIG[metric_name] = metric_config
+
+    def parse_parameters(json_config):
+        """
+        Parse parameters from JSON configuration file.
+        """
+
+        if "parameters" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Parameters group is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if args.mode == "tune" and args.algorithm == "ax":
+            config = list()
+        else:
+            config = dict()
+
+        top_param_or_def_found, package_param_or_def_found = False, False
+        for key, value in json_config["parameters"].items():
+            if key == "best_result":
+                continue
+
+            top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
+            package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
+
+            if not isinstance(value, dict):
+                if args.mode == "tune" and args.algorithm == "ax":
+                    param_dict = read_tune_ax(key, value)
+                    if param_dict:
+                        config.append(param_dict)
+                elif args.mode == "tune" and args.algorithm == "pbt":
+                    param_dict = read_tune(value)
+                    if param_dict:
+                        config[key] = param_dict
+                else:
+                    config[key] = value
+            elif args.mode == "sweep":
+                config[key] = value
+            elif args.mode == "tune" and args.algorithm == "ax":
+                config.append(read_tune_ax(key, value))
+            elif args.mode == "tune" and args.algorithm == "pbt":
+                config[key] = read_tune(value)
+            elif args.mode == "tune":
+                config[key] = read_tune(value)
+
+        if args.mode == "tune":
+            config = apply_condition(config, json_config["parameters"])
+
+        if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
+            print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
+            sys.exit(1)
+        if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
+            print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
+            sys.exit(1)
+
+        return config
+
     # Check file exists and whether it is a valid JSON file.
     assert os.path.isfile(file_name), f"File {file_name} not found."
     try:
@@ -386,65 +488,9 @@ def read_config(file_name):
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON file: {file_name}")
 
-    if args.mode == "tune" and args.algorithm == "ax":
-        config = list()
-    else:
-        config = dict()
-
-    top_param_or_def_found, package_param_or_def_found, sdc_file_found, fr_file_found = False, False, False, False
-    for key, value in data.items():
-        if key == "best_result":
-            continue
-
-        if "_FILE_PATH" in key and value != "":
-            top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
-            package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
-            sdc_file_found = (key == "_SDC_FILE_PATH") or sdc_file_found
-            fr_file_found = (key == "_FR_FILE_PATH") or fr_file_found
-
-            if key in JSON_FILES_BASE.keys():
-                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
-            full_path = f"{os.path.dirname(file_name)}/{value}"
-            JSON_FILES_BASE[key] = full_path.split("OpenROAD-flow-scripts/")[1]
-            continue
-
-        if not isinstance(value, dict):
-            if args.mode == "tune" and args.algorithm == "ax":
-                param_dict = read_tune_ax(key, value)
-                if param_dict:
-                    config.append(param_dict)
-            elif args.mode == "tune" and args.algorithm == "pbt":
-                param_dict = read_tune(value)
-                if param_dict:
-                    config[key] = param_dict
-            else:
-                config[key] = value
-        elif args.mode == "sweep":
-            config[key] = value
-        elif args.mode == "tune" and args.algorithm == "ax":
-            config.append(read_tune_ax(key, value))
-        elif args.mode == "tune" and args.algorithm == "pbt":
-            config[key] = read_tune(value)
-        elif args.mode == "tune":
-            config[key] = read_tune(value)
-
-    if args.mode == "tune":
-        config = apply_condition(config, data)
-
-    if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
-        print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
-        sys.exit(1)
-    if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
-        print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
-        sys.exit(1)
-
-    if not sdc_file_found:
-        print(f"[ERROR TUN-0020] SDC file is missing in JSON configuration file.")
-        sys.exit(1)
-
-    if not fr_file_found:
-        print(f"[ERROR TUN-0020] FR file is missing in JSON configuration file.")
-        sys.exit(1)
+    parse_filepaths(data)
+    parse_metrics(data)
+    config = parse_parameters(data)
 
     return config
 
@@ -1080,11 +1126,10 @@ def save_best(results):
     """
     Save best configuration of parameters found.
     """
+
     best_config = results.best_config
+    best_config["score_metrics_config"] = METRICS_CONFIG
     best_config["best_result"] = results.best_result[METRIC]
-    best_config["coeff_perform"] = COEFF_PERFORM
-    best_config["coeff_area"] = COEFF_AREA
-    best_config["coeff_power"] = COEFF_POWER
     trial_id = results.best_trial.trial_id
     new_best_path = f"{BASE_LOCAL_DIR}/{args.experiment}/"
     new_best_path += f"autotuner-best-{trial_id}.json"
