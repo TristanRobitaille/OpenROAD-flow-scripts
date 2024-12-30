@@ -70,8 +70,9 @@ ERROR_METRIC = 9e99
 ORFS_FLOW_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../../../flow")
 )
-ALLOWED_STAGES = ["floorplan", "place", "cts", "route", "all"]
-METRICS_MAP = {
+ALLOWED_SIM_STAGES = ["rtl_sim"]
+ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all"]
+FLOW_METRICS_MAP = {
     "floorplan": {  "total_power"   : ["floorplan", "power__total"],
                     "core_util"     : ["floorplan", "design__instance__utilization"],
                     "worst_slack"   : ["floorplan", "timing__setup__ws"]},
@@ -140,7 +141,11 @@ class AutoTunerBase(tune.Trainable):
         """
         Run step experiment and compute its score.
         """
-        metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
+        metrics_file = ""
+        if args.stage_stop in ALLOWED_SIM_STAGES:
+            metrics_file = run_sim()
+        else:
+            metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
         self.step_ += 1
         score = self.evaluate(self.read_metrics(metrics_file))
         # Feed the score back to Tune. return must match 'metric' used in tune.run()
@@ -185,9 +190,9 @@ class AutoTunerBase(tune.Trainable):
             metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
 
         for metric_name in metrics_dict.keys():
-            if metric_name in METRICS_MAP[args.stage_stop].keys():
-                stage_name = METRICS_MAP[args.stage_stop][metric_name][0]
-                metric_json_name = METRICS_MAP[args.stage_stop][metric_name][1]
+            if metric_name in FLOW_METRICS_MAP[args.stage_stop].keys():
+                stage_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][0]
+                metric_json_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][1]
                 metrics_dict[metric_name] = data[stage_name][metric_json_name]
 
         return metrics_dict
@@ -239,7 +244,7 @@ class PPAImprov(AutoTunerBase):
         return (score_upper_bound - score)
 
     def evaluate(self, metrics):
-        expected_metrics = METRICS_MAP[args.stage_stop].keys()
+        expected_metrics = FLOW_METRICS_MAP[args.stage_stop].keys()
         for metric in expected_metrics:
             if metrics[metric] == "N/A" or reference[metric] == "N/A":
                 return ERROR_METRIC
@@ -723,8 +728,8 @@ def openroad(base_dir, parameters, flow_variant):
     make_command = export_command
     make_command += f"make"
     if args.stage_stop != "all":
-        for i in range (ALLOWED_STAGES.index(args.stage_stop) + 1):
-            make_command += f" {ALLOWED_STAGES[i]}" # Append preceding flow stages to make command
+        for i in range (ALLOWED_OPENROAD_STAGES.index(args.stage_stop) + 1):
+            make_command += f" {ALLOWED_OPENROAD_STAGES[i]}" # Append preceding flow stages to make command
     make_command += f" -C {base_dir}/flow DESIGN_CONFIG=designs/"
     make_command += f"{args.platform}/{args.design}/config.mk"
     make_command += f" PLATFORM={args.platform}"
@@ -754,6 +759,9 @@ def openroad(base_dir, parameters, flow_variant):
 
     return metrics_file
 
+def run_sim():
+    print(f"TODO: Implement run_sim function.")
+    sys.exit(1)
 
 def clone(path):
     """
@@ -1013,10 +1021,10 @@ def parse_arguments():
     parser.add_argument(
         "--stage_stop",
         type=str,
-        metavar="<all, floorplan, place, cts, route...>",
+        metavar="<all, floorplan, place, cts, route, rtl_sim...>",
         default="all",
-        help="Stage at wchich to stop the flow and use for metrics.",
-        choices=ALLOWED_STAGES
+        help="Stage at which to stop the flow and use for metrics.",
+        choices=ALLOWED_OPENROAD_STAGES + ALLOWED_SIM_STAGES
     )
 
     arguments = parser.parse_args()
