@@ -304,14 +304,8 @@ def copy_repo(repo_dir, copy_dir):
 
     # Update the file paths in the configuration dictionary
     files = deepcopy(JSON_FILES_BASE)
-    files["_SDC_FILE_PATH"] = copy_dir / files["_SDC_FILE_PATH"]
-    files["_FR_FILE_PATH"] = copy_dir / files["_FR_FILE_PATH"]
-    if "_TOP_LEVEL_FILE_PATH" in files.keys():
-        files["_TOP_LEVEL_FILE_PATH"] = copy_dir / files["_TOP_LEVEL_FILE_PATH"]
-    if "_PACKAGE_FILE_PATH" in files.keys():
-        files["_PACKAGE_FILE_PATH"] = copy_dir / files["_PACKAGE_FILE_PATH"]
-    if "_SIM_FILE_PATH" in files.keys():
-        files["_SIM_FILE_PATH"] = copy_dir / files["_SIM_FILE_PATH"]
+    for key, filepath in files.items():
+        files[key] = copy_dir / filepath
 
     return files
 
@@ -585,41 +579,27 @@ def parse_config(config, files):
     Parse configuration received from tune into make variables.
     """
     options = ""
-    sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
+    prefix_dicts = {
+        "_FR_": dict(), "_SDC_": dict(),
+        "_TOP_PARAM_": dict(), "_TOP_DEF_": dict(),
+        "_PACKAGE_PARAM_": dict(), "_PACKAGE_DEF_": dict()
+    }
     flow_variables = parse_flow_variables()
 
-    if "_TOP_LEVEL_FILE_PATH" in files.keys() and "_PACKAGE_FILE_PATH" in files.keys():
+    if "_TOP_LEVEL_FILE_PATH" in files.keys() or "_PACKAGE_FILE_PATH" in files.keys():
         verilog_rewriter = VerilogRewriter(top_fp=files["_TOP_LEVEL_FILE_PATH"], pkg_fp=files["_PACKAGE_FILE_PATH"])
-    
+
     for key, value in config.items():
-        # Keys that begin with underscore need special handling.
         if key.startswith("_"):
-            # Variables to be injected into fastroute.tcl
-            if key.startswith("_FR_"):
-                fast_route[key.replace("_FR_", "", 1)] = value
-            # Variables to be injected into constraints.sdc
-            elif key.startswith("_SDC_"):
-                sdc[key.replace("_SDC_", "", 1)] = value
-            elif key.startswith("_TOP_PARAM_"):
-                top_params[key.replace("_TOP_PARAM_", "", 1)] = value
-            elif key.startswith("_TOP_DEF_"):
-                top_defines[key.replace("_TOP_DEF_", "", 1)] = value
-            elif key.startswith("_PACKAGE_PARAM_"):
-                pkg_params[key.replace("_PACKAGE_PARAM_", "", 1)] = value
-            elif key.startswith("_PACKAGE_DEF_"):
-                pkg_defines[key.replace("_PACKAGE_DEF_", "", 1)] = value
-            # Special substitution cases
-            elif key == "_PINS_DISTANCE":
+            prefix = next((p for p in prefix_dicts if key.startswith(p)), None)
+            if prefix:
+                prefix_dicts[prefix][key.replace(prefix, "", 1)] = value
+            elif key == "_PINS_DISTANCE": # Special substitution
                 options += f' PLACE_PINS_ARGS="-min_distance {value}"'
-            elif key == "_SYNTH_FLATTEN":
-                print(
-                    "[WARNING TUN-0013] Non-flatten the designs are not "
-                    "fully supported, ignoring _SYNTH_FLATTEN parameter."
-                )
-        # Default case is VAR=VALUE
+            elif key == "_SYNTH_FLATTEN": # Special substitution
+                print("[WARNING TUN-0013] Non-flatten the designs are not fully supported, ignoring _SYNTH_FLATTEN parameter.")
         else:
-            # FIXME there is no robust way to get this metainformation from
-            # ORFS about the variables, so disable this code for now.
+            # FIXME there is no robust way to get this metainformation from ORFS about the variables, so disable this code for now.
 
             # Sanity check: ignore all flow variables that are not tunable
             # if key not in flow_variables:
@@ -627,14 +607,14 @@ def parse_config(config, files):
             #     sys.exit(1)
             options += f" {key}={value}"
 
-    if bool(sdc):
-        write_sdc(sdc, files["_SDC_FILE_PATH"])
+    if prefix_dicts["_SDC_"]:
+        write_sdc(prefix_dicts["_SDC_"], files["_SDC_FILE_PATH"])
         options += f" SDC_FILE={files['_SDC_FILE_PATH']}"
-    if bool(fast_route):
-        write_fast_route(fast_route, files["_FR_FILE_PATH"])
+    if prefix_dicts["_FR_"]:
+        write_fast_route(prefix_dicts["_FR_"], files["_FR_FILE_PATH"])
         options += f" FASTROUTE_TCL={files['_FR_FILE_PATH']}"
-    if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
-        verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
+    if prefix_dicts["_TOP_PARAM_"] or prefix_dicts["_TOP_DEF_"] or prefix_dicts["_PACKAGE_PARAM_"] or prefix_dicts["_PACKAGE_DEF_"]:
+        verilog_rewriter.update_sv(prefix_dicts["_TOP_DEF_"], prefix_dicts["_TOP_PARAM_"], prefix_dicts["_PACKAGE_DEF_"], prefix_dicts["_PACKAGE_PARAM_"])
     return options
 
 def write_sdc(variables, sdc_file_path):
