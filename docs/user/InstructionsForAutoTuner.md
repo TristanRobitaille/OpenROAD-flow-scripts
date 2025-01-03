@@ -1,12 +1,13 @@
 # Instructions for AutoTuner with Ray
 
-_AutoTuner_ is a "no-human-in-loop" parameter tuning framework for commercial and academic RTL-to-GDS flows.
+_AutoTuner_ is a "no-human-in-loop" parameter tuning framework for commercial and academic RTL-to-GDS flow.
 AutoTuner provides a generic interface where users can define parameter configuration as JSON objects.
-This enables AutoTuner to easily support various tools and flows. AutoTuner also utilizes [METRICS2.1](https://github.com/ieee-ceda-datc/datc-rdf-Metrics4ML) to capture PPA
-of individual search trials. With the abundant features of METRICS2.1, users can explore various reward functions that steer the flow autotuning to different PPA goals.
+This enables AutoTuner to easily support various tools and flows. AutoTuner also utilizes [METRICS2.1](https://github.com/ieee-ceda-datc/datc-rdf-Metrics4ML) to capture metrics
+of individual search trials. With the abundant features of METRICS2.1, users can explore various reward functions that steer the flow autotuning to different goals.
+AutoTuner can source the user-defined metrics from the RTL-to-GDS flow (stopping at a select stage) or from an RTL simulation.
 
 AutoTuner provides the following main functionalities.
-* Automatic hyperparameter tuning framework for OpenROAD-flow-script (ORFS)
+* Automatic RTL-to-GDS flow hyperparameter tuning framework based on the results of OpenROAD-flow-script (ORFS) or RTL simulation
 * Automatic parameter and define tuning framework for Verilog design (top-level and package) for Design Space Exploration (DSE)
 * Parametric sweeping experiments for ORFS
 
@@ -18,11 +19,11 @@ AutoTuner contains top-level Python script for ORFS, each of which implements a 
 * Tree Parzen Estimator + Covariance Matrix Adaptation Evolution Strategy ([Optuna](https://optuna.org/))
 * Evolutionary Algorithm ([Nevergrad](https://github.com/facebookresearch/nevergrad))
 
-User-defined coefficient values (`coeff_perform`, `coeff_power`, `coeff_area`) of three objectives to set the direction of tuning are written in the script. Each coefficient is expressed as a
-global variable at the `get_ppa` function in `PPAImprov` class in the script (`coeff_perform`, `coeff_power`, `coeff_area`). Efforts to optimize each of the objectives are proportional to the specified coefficients.
+User-defined metrics and coefficient values are passed-in in the configuration `.json` file. The user can define their own score function in the `AutoTunerBase.get_score()` function.
+By default, the score is based on the PPA of the design.
 
-AutoTuner uses Slang to overwrite `parameter` and `define` in a specified Verilog/SystemVerilog (usually the top-level or a wrapper) file and in a specified Verilog/SystemVerilog package file. This lets the user evaluate PPA
-for different design configurations.
+AutoTuner uses Slang to overwrite `parameter` and `define` in a specified Verilog/SystemVerilog (usually the top-level or a wrapper) file and in a specified Verilog/SystemVerilog package file.
+This lets the user evaluate different design configurations.
 
 
 ## Setting up AutoTuner
@@ -45,7 +46,7 @@ Make sure you run the following commands in the ORFS root directory.
 
 ## Input JSON structure
 
-Sample JSON [file](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/designs/sky130hd/aes/autotuner.json) for Sky130HD `aes` design:
+Sample JSON [file](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/designs/sky130hd/jpeg/autotuner.json) for Sky130HD `jpeg` design:
 
 Alternatively, here is a minimal example to get started:
 
@@ -107,7 +108,8 @@ Alternatively, here is a minimal example to get started:
         "_SDC_FILE_PATH": "constraint.sdc",
         "_FR_FILE_PATH": "fastroute.tcl",
         "_TOP_LEVEL_FILE_PATH": "../../src/jpeg/jpeg_encoder.v",
-        "_PACKAGE_FILE_PATH": "../../src/jpeg/jpeg_pkg.sv"
+        "_PACKAGE_FILE_PATH": "../../src/jpeg/jpeg_pkg.sv",
+        "_SIM_FILE_PATH": ""
     },
     "score_metrics_config" : {
         "performance" : {
@@ -116,7 +118,7 @@ Alternatively, here is a minimal example to get started:
         "power" : {
             "coeff": 2
         },
-        "area" : {
+        "branch_pred_miss_rate" : {
             "coeff": 1
         }
     }
@@ -165,7 +167,14 @@ The top-level file to use is specified in the `.json` file with the field  `"_TO
 
 ## Defining metrics used to compute the score of a run
 
-The user can define their metrics used to compute the score of a run. The metrics are defined in the configuration `.json` and the function to compute the score is defined in the `PPAImprov.get_score()` method. By default, the PPA is computed using the coefficients shown in the above JSON snippet.
+The user can define their metrics used to compute the score of a run. The metrics are defined in the configuration `.json` and the function to compute the score is defined in the `ScoreImprov.get_score()` method. By default, the score is the PPA and is computed using the coefficients shown in the above JSON snippet. The metrics come from the output of the selected OpenRoad flow stage or the RTL simulation.
+
+To run an RTL simulation instead of the OpenRoad flow, use the `rtl_sim` options for the `stage_stop` argument. For this, a file path to an executable simulation (`.py`, `.sh` or a Makefile) is required. If using a `.sh` script, make sure to have the correct execute permissions.
+The simulation is required to output metrics as defined in the `score_metrics_config` group of the `.json` configuration file. The script parse the stdout output of the simulation, which must contain, for example:
+```shell
+branch_pred_miss_rate: 0.315149
+percent_cache_miss: 0.71828
+```
 
 ## How to use
 
@@ -222,44 +231,44 @@ GCP Setup Tutorial coming soon.
 
 
 ### List of input arguments
-| Argument                      | Description                                                                                           | Default |
-|-------------------------------|-------------------------------------------------------------------------------------------------------|---------|
-| `--design`                    | Name of the design for Autotuning.                                                                    ||
-| `--platform`                  | Name of the platform for Autotuning.                                                                  ||
-| `--config`                    | Configuration file that sets which knobs to use for Autotuning.                                       ||
-| `--stage_stop`                | Flow stage at which to stop script. May be one of `["floorplan", "place", "cts", "route", "all"]`     | all |
-| `--experiment`                | Experiment name. This parameter is used to prefix the FLOW_VARIANT and to set the Ray log destination.| test |
-| `--git_clean`                 | Clean binaries and build files. **WARNING**: may lose previous data.                                  ||
-| `--git_clone`                 | Force new git clone. **WARNING**: may lose previous data.                                             ||
-| `--git_clone_args`            | Additional git clone arguments.                                                                       ||
-| `--git_latest`                | Use latest version of OpenROAD app.                                                                   ||
-| `--git_or_branch`             | OpenROAD app branch to use.                                                                           ||
-| `--git_orfs_branch`           | OpenROAD-flow-scripts branch to use.                                                                  ||
-| `--git_url`                   | OpenROAD-flow-scripts repo URL to use.                                                                | [ORFS GitHub repo](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) |
-| `--build_args`                | Additional arguments given to ./build_openroad.sh                                                     ||
-| `--samples`                   | Number of samples for tuning.                                                                         | 10 |
-| `--jobs`                      | Max number of concurrent jobs.                                                                        | # of CPUs / 2 |
-| `--openroad_threads`          | Max number of threads usable.                                                                         | 16 |
-| `--server`                    | The address of Ray server to connect.                                                                 ||
-| `--port`                      | The port of Ray server to connect.                                                                    | 10001 |
-| `--timeout`                   | Time limit (in hours) for each trial run.                                                             | No limit |
-| `-v` or `--verbose`           | Verbosity Level. [0: Only ray status, 1: print stderr, 2: print stdout on top of what is in level 0 and 1. ]                  | 0 |
-|                               |                                                                                                       ||
+| Argument                      | Description                                                                                                   | Default |
+|-------------------------------|---------------------------------------------------------------------------------------------------------------|---------|
+| `--design`                    | Name of the design for Autotuning.                                                                            ||
+| `--platform`                  | Name of the platform for Autotuning.                                                                          ||
+| `--config`                    | Configuration file that sets which knobs to use for Autotuning.                                               ||
+| `--stage_stop`                | Flow stage at which to stop script. May be one of `["rtl_sim", "floorplan", "place", "cts", "route", "all"]`  | all |
+| `--experiment`                | Experiment name. This parameter is used to prefix the FLOW_VARIANT and to set the Ray log destination.        | test |
+| `--git_clean`                 | Clean binaries and build files. **WARNING**: may lose previous data.                                          ||
+| `--git_clone`                 | Force new git clone. **WARNING**: may lose previous data.                                                     ||
+| `--git_clone_args`            | Additional git clone arguments.                                                                               ||
+| `--git_latest`                | Use latest version of OpenROAD app.                                                                           ||
+| `--git_or_branch`             | OpenROAD app branch to use.                                                                                   ||
+| `--git_orfs_branch`           | OpenROAD-flow-scripts branch to use.                                                                          ||
+| `--git_url`                   | OpenROAD-flow-scripts repo URL to use.                                                                        | [ORFS GitHub repo](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) |
+| `--build_args`                | Additional arguments given to ./build_openroad.sh                                                             ||
+| `--samples`                   | Number of samples for tuning.                                                                                 | 10 |
+| `--jobs`                      | Max number of concurrent jobs.                                                                                | # of CPUs / 2 |
+| `--openroad_threads`          | Max number of threads usable.                                                                                 | 16 |
+| `--server`                    | The address of Ray server to connect.                                                                         ||
+| `--port`                      | The port of Ray server to connect.                                                                            | 10001 |
+| `--timeout`                   | Time limit (in hours) for each trial run.                                                                     | No limit |
+| `-v` or `--verbose`           | Verbosity Level. [0: Only ray status, 1: print stderr, 2: print stdout on top of what is in level 0 and 1. ]  | 0 |
+|                               |                                                                                                               ||
 
 #### Input arguments specific to tune mode
 The following input arguments are applicable for tune mode only.
 
-| Argument                      | Description                                                                                           | Default |
-|-------------------------------|-------------------------------------------------------------------------------------------------------|---------|
-| `--algorithm`                 | Search algorithm to use for Autotuning.                                                               | hyperopt |
-| `--eval`                      | Evaluate function to use with search algorithm.                                                       ||
-| `--iterations`                | Number of iterations for tuning.                                                                      | 1 |
-| `--resources_per_trial`       | Number of CPUs to request for each tuning job.                                                        | 1 |
-| `--reference`                 | Reference file for use with PPAImprov.                                                                ||
-| `--perturbation`              | Perturbation interval for PopulationBasedTraining                                                     | 25 |
-| `--seed`                      | Random seed.                                                                                          | 42 |
-| `--resume`                    | Resume previous run.                                                                                  ||
-|                               |                                                                                                       ||
+| Argument                      | Description                                                                                                   | Default |
+|-------------------------------|---------------------------------------------------------------------------------------------------------------|---------|
+| `--algorithm`                 | Search algorithm to use for Autotuning.                                                                       | hyperopt |
+| `--eval`                      | Evaluate function to use with search algorithm.                                                               ||
+| `--iterations`                | Number of iterations for tuning.                                                                              | 1 |
+| `--resources_per_trial`       | Number of CPUs to request for each tuning job.                                                                | 1 |
+| `--reference`                 | Reference file for use with ScoreImprov.                                                                      ||
+| `--perturbation`              | Perturbation interval for PopulationBasedTraining                                                             | 25 |
+| `--seed`                      | Random seed.                                                                                                  | 42 |
+| `--resume`                    | Resume previous run.                                                                                          ||
+|                               |                                                                                                               ||
 
 ### GUI
 

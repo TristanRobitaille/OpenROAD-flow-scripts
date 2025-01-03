@@ -132,9 +132,9 @@ class AutoTunerBase(tune.Trainable):
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
         self.copy_dir = Path.cwd() / self.variant
 
-        files = copy_repo(self.repo_dir, self.copy_dir)
+        self.files = copy_repo(self.repo_dir, self.copy_dir)
 
-        self.parameters = parse_config(config, files)
+        self.parameters = parse_config(config, self.files)
 
     def step(self):
         """
@@ -142,7 +142,7 @@ class AutoTunerBase(tune.Trainable):
         """
         metrics_file = ""
         if args.stage_stop in ALLOWED_SIM_STAGES:
-            metrics_file = run_sim()
+            metrics_file = run_rtl_sim(self.copy_dir, self.variant, self.files)
         else:
             metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
         self.step_ += 1
@@ -157,15 +157,21 @@ class AutoTunerBase(tune.Trainable):
         Default evaluation function optimizes effective clock period.
         """
 
-        if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
-            return ERROR_METRIC
+        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+            if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
+                return ERROR_METRIC
 
-        gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
-        score = metrics["clk_period"] - metrics["worst_slack"]
-        score = score * (self.step_ / 100) ** (-1)
+            gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
+            score = metrics["clk_period"] - metrics["worst_slack"]
+            score = score * (self.step_ / 100) ** (-1)
 
-        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
-            score += gamma * metrics["num_drc"]
+            if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+                score += gamma * metrics["num_drc"]
+        else: # RTL sim
+            score = 0
+            for metric_name, metric_config in METRICS_CONFIG.items():
+                if metric_name in metrics:
+                    score += metric_config["coeff"] * metrics[metric_name]
         return score
 
     @classmethod
@@ -176,24 +182,27 @@ class AutoTunerBase(tune.Trainable):
         with open(file_name) as file:
             data = json.load(file)
 
-        metrics_dict = {
-            "clk_period": 9999999,
-            "worst_slack": "N/A",
-            "wirelength": "N/A",
-            "num_drc": "N/A",
-            "total_power": "N/A",
-            "core_util": "N/A",
-        }
-
-        if len(data["constraints"]["clocks__details"]) > 0:
-            metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
-
-        for metric_name in metrics_dict.keys():
-            if metric_name in FLOW_METRICS_MAP[args.stage_stop].keys():
-                stage_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][0]
-                metric_json_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][1]
-                metrics_dict[metric_name] = data[stage_name][metric_json_name]
-
+        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+            metrics_dict = {
+                "clk_period": 9999999,
+                "worst_slack": "N/A",
+                "wirelength": "N/A",
+                "num_drc": "N/A",
+                "total_power": "N/A",
+                "core_util": "N/A",
+            }
+            if len(data["constraints"]["clocks__details"]) > 0:
+                metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
+            for metric_name in metrics_dict.keys():
+                if metric_name in FLOW_METRICS_MAP[args.stage_stop].keys():
+                    stage_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][0]
+                    metric_json_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][1]
+                    metrics_dict[metric_name] = data[stage_name][metric_json_name]
+        else:
+            metrics_dict = dict()
+            for metric_name, value in data[args.stage_stop].items():
+                metrics_dict[metric_name] = value
+    
         return metrics_dict
 
 
@@ -212,47 +221,68 @@ class ScoreImprov(AutoTunerBase):
         Compute score term for evaluate.
         """
 
-        assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
-        assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
-        assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
-
-        eff_clk_period = metrics["clk_period"]
-        if metrics["worst_slack"] < 0:
-            eff_clk_period -= metrics["worst_slack"]
-
-        eff_clk_period_ref = reference["clk_period"]
-        if reference["worst_slack"] < 0:
-            eff_clk_period_ref -= reference["worst_slack"]
-
         def percent(x_1, x_2):
-            return (x_1 - x_2) / x_1 * 100
+            return 100 * (x_1 - x_2) / x_1
 
-        collected_metrics = {
-            "performance": percent(eff_clk_period_ref, eff_clk_period),
-            "power": percent(reference["total_power"], metrics["total_power"]),
-            "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
-        }
+        def sum_metrics(collected_metrics):
+            """
+            Compute the sum of all metrics * coefficient.
+            Lower values of score are better.
+            """
+            score_upper_bound, score = 0, 0
+            for metric_name, metric_data in METRICS_CONFIG.items():
+                score_upper_bound += (100 * metric_data["coeff"])
+                score += (metric_data["coeff"] * collected_metrics[metric_name])
+            
+            return score_upper_bound, score
 
-        # Lower values of score are better.
-        score_upper_bound, score = 0, 0
-        for metric_name, metric_data in METRICS_CONFIG.items():
-            score_upper_bound += (100 * metric_data["coeff"])
-            score += (metric_data["coeff"] * collected_metrics[metric_name])
+        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+            assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
+            assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
+            assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
 
-        return (score_upper_bound - score)
+            eff_clk_period = metrics["clk_period"]
+            if metrics["worst_slack"] < 0:
+                eff_clk_period -= metrics["worst_slack"]
+
+            eff_clk_period_ref = reference["clk_period"]
+            if reference["worst_slack"] < 0:
+                eff_clk_period_ref -= reference["worst_slack"]
+
+            collected_metrics = {
+                "performance": percent(eff_clk_period_ref, eff_clk_period),
+                "power": percent(reference["total_power"], metrics["total_power"]),
+                "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
+            }
+
+            score_upper_bound, score = sum_metrics(collected_metrics)
+            return score
+        else: # RTL sim
+            collected_metrics = dict()
+            for metric_name, metric_val in metrics.items(): # This assumes that for all metrics, lower is better
+                if metric_name not in reference:
+                    print(f"[{TerminalTool.warning}] Metric {metric_name} not found in reference! Exiting.")
+                    sys.exit(1)
+
+                collected_metrics[metric_name] = percent(reference[metric_name], metric_val)
+            score_upper_bound, score = sum_metrics(collected_metrics)
+            return score
+
 
     def evaluate(self, metrics):
-        expected_metrics = FLOW_METRICS_MAP[args.stage_stop].keys()
-        for metric in expected_metrics:
-            if metrics[metric] == "N/A" or reference[metric] == "N/A":
-                return ERROR_METRIC
+        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+            for metric in FLOW_METRICS_MAP[args.stage_stop].keys():
+                if metrics[metric] == "N/A" or reference[metric] == "N/A":
+                    return ERROR_METRIC
 
-        score = self.get_score(metrics)
-        score_normalized = score * (self.step_ / 100) ** (-1)
-        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
-            gamma = score / 10
-            score_normalized += gamma * metrics["num_drc"]
-
+            score = self.get_score(metrics)
+            score_normalized = score * (self.step_ / 100) ** (-1)
+            if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+                gamma = score / 10
+                score_normalized += gamma * metrics["num_drc"]
+        else: # RTL sim
+            score = self.get_score(metrics)
+            score_normalized = score * (self.step_ / 100) ** (-1)
         return score
 
 
@@ -280,6 +310,8 @@ def copy_repo(repo_dir, copy_dir):
         files["_TOP_LEVEL_FILE_PATH"] = copy_dir / files["_TOP_LEVEL_FILE_PATH"]
     if "_PACKAGE_FILE_PATH" in files.keys():
         files["_PACKAGE_FILE_PATH"] = copy_dir / files["_PACKAGE_FILE_PATH"]
+    if "_SIM_FILE_PATH" in files.keys():
+        files["_SIM_FILE_PATH"] = copy_dir / files["_SIM_FILE_PATH"]
 
     return files
 
@@ -409,12 +441,14 @@ def read_config(file_name):
                 print(f"[WARNING TUN-xxx] Field {key} isn't valid for group 'files'. Ignoring it.")
                 continue
 
+            if key in JSON_FILES_BASE.keys():
+                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+
             if filepath == "":
                 print(f"[WARNING TUN-xxx] Value for key {key} in the 'files' group is blank. Ignoring it.")
                 continue
 
-            if key in JSON_FILES_BASE.keys():
-                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+            filepath = Path(filepath)
 
             base_dir = Path(file_name).parent
             full_path = base_dir / Path(filepath)
@@ -451,6 +485,10 @@ def read_config(file_name):
         top_param_or_def_found, package_param_or_def_found = False, False
         for key, value in json_config["parameters"].items():
             if key == "best_result":
+                continue
+
+            # For RTL simulation, only consider parameters starting with _TOP or _PACKAGE
+            if args.stage_stop in ALLOWED_SIM_STAGES and not (key.startswith("_TOP") or key.startswith("_PACKAGE")):
                 continue
 
             top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
@@ -549,8 +587,10 @@ def parse_config(config, files):
     options = ""
     sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
     flow_variables = parse_flow_variables()
+
     if "_TOP_LEVEL_FILE_PATH" in files.keys() and "_PACKAGE_FILE_PATH" in files.keys():
         verilog_rewriter = VerilogRewriter(top_fp=files["_TOP_LEVEL_FILE_PATH"], pkg_fp=files["_PACKAGE_FILE_PATH"])
+    
     for key, value in config.items():
         # Keys that begin with underscore need special handling.
         if key.startswith("_"):
@@ -596,7 +636,6 @@ def parse_config(config, files):
     if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
         verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
     return options
-
 
 def write_sdc(variables, sdc_file_path):
     """
@@ -761,9 +800,56 @@ def openroad(base_dir, parameters, flow_variant):
 
     return metrics_file
 
-def run_sim():
-    # if ()
-    sys.exit(1)
+def run_rtl_sim(base_dir, flow_variant, files):
+    """
+    Runs the simulation and returns the path to the metrics file.
+    """
+
+    flow_variant = f"{args.experiment}/{flow_variant}"
+    log_path = os.getcwd() + "/"
+    report_path = log_path.replace("logs", "reports")
+    sim_report_path = base_dir / "flow" / "reports"
+    sim_file_path = files["_SIM_FILE_PATH"]
+    
+    run_command(f"mkdir -p {log_path}")
+    run_command(f"mkdir -p {sim_report_path}")
+
+    rtl_sim_command = ""
+
+    if sim_file_path.suffix == ".py":
+        rtl_sim_command += f"python {sim_file_path}"
+    elif sim_file_path.suffix == ".sh":
+        rtl_sim_command += f"{sim_file_path}"
+    elif sim_file_path.name in ["Makefile", "makefile"] or sim_file_path.suffix == ".mk":
+        rtl_sim_command += f"make -f {sim_file_path}"
+    else:
+        print(f"[ERROR TUN-xxxxx] Unsupported simulation file type: {sim_file_path.suffix}")
+
+    run_command(
+        rtl_sim_command,
+        stderr_file = Path(log_path) / "error-rtl_sim.log",
+        stdout_file = Path(sim_report_path) / "rtl_sim-stdout.log"
+    )
+
+    metrics_names_file = Path(sim_report_path) / "rtl_sim_metrics_names.json"
+    with open(metrics_names_file, "w") as file:
+        json.dump(METRICS_CONFIG, file, indent=2)
+
+    metrics_file = sim_report_path / "metrics.json"
+    metrics_command = f"{base_dir}/flow/util/genMetrics.py -x"
+    metrics_command += f" -v {flow_variant}"
+    metrics_command += f" -d {args.design}"
+    metrics_command += f" -p {args.platform}"
+    metrics_command += f" -o {metrics_file}"
+    run_command(
+        metrics_command,
+        stderr_file = Path(log_path) / "error-metrics.log",
+        stdout_file = Path(log_path) / "metrics-stdout.log"
+    )
+
+    os.remove(metrics_names_file) # Cleanup metrics name file
+
+    return metrics_file
 
 def clone(path):
     """
@@ -1267,7 +1353,7 @@ if __name__ == "__main__":
         if args.algorithm != "ax":
             tune_args["config"] = config_dict
 
-        analysis = tune.run(TrainClass, **tune_args)
+        analysis = tune.run(TrainClass, **tune_args)            
 
         task_id = save_best.remote(analysis)
         _ = ray.get(task_id)

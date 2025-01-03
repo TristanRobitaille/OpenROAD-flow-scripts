@@ -136,6 +136,21 @@ def extractTagFromFile(
         print("[ERROR] Failed to open file:", searchFilePath)
         jsonFile[jsonTag] = "ERR"
 
+def extractRtlSimMetrics(jsonFile, simLogFile, metricsNameFile):
+    """Extract metrics from RTL simulation log file and returns whether the file was found."""
+    if os.path.isfile(simLogFile):
+        with open(metricsNameFile, "r") as file:
+            metricsToExtract = json.load(file)
+
+        for metric_name in metricsToExtract.keys():
+            extractTagFromFile(
+                f"rtl_sim__{metric_name}",
+                jsonFile,
+                f"{metric_name}: +(\\S+)",
+                simLogFile,
+            )
+        return True
+    return False
 
 def extractGnuTime(prefix, jsonFile, file):
     if not os.path.isfile(file):
@@ -250,60 +265,69 @@ def extract_metrics(cwd, platform, design, flow_variant, output, hier_json):
     metrics_dict["run__flow__platform_commit"] = cmdOutput
     metrics_dict["run__flow__variant"] = flow_variant
 
-    # Synthesis
+    # RTL sim
     # =========================================================================
-
-    extractTagFromFile(
-        "synth__design__instance__count__stdcell",
+    running_rtl_sim = extractRtlSimMetrics(
         metrics_dict,
-        "Number of cells: +(\\S+)",
-        rptPath + "/synth_stat.txt",
+        "reports/rtl_sim-stdout.log",
+        "./reports/rtl_sim_metrics_names.json"
     )
 
-    extractTagFromFile(
-        "synth__design__instance__area__stdcell",
-        metrics_dict,
-        "Chip area for (?:top )?module.*: +(\\S+)",
-        rptPath + "/synth_stat.txt",
-    )
+    if not running_rtl_sim:
+        # Synthesis
+        # =========================================================================
 
-    # Clocks
-    # =========================================================================
-    clk_list = read_sdc(resultPath + "/2_floorplan.sdc")
-    metrics_dict["constraints__clocks__count"] = len(clk_list)
-    metrics_dict["constraints__clocks__details"] = clk_list
+        extractTagFromFile(
+            "synth__design__instance__count__stdcell",
+            metrics_dict,
+            "Number of cells: +(\\S+)",
+            rptPath + "/synth_stat.txt",
+        )
 
-    # Floorplan
-    # =========================================================================
-    merge_jsons(logPath, metrics_dict, "2_*.json")
+        extractTagFromFile(
+            "synth__design__instance__area__stdcell",
+            metrics_dict,
+            "Chip area for (?:top )?module.*: +(\\S+)",
+            rptPath + "/synth_stat.txt",
+        )
 
-    # Place
-    # =========================================================================
-    merge_jsons(logPath, metrics_dict, "3_*.json")
+        # Clocks
+        # =========================================================================
+        clk_list = read_sdc(resultPath + "/2_floorplan.sdc")
+        metrics_dict["constraints__clocks__count"] = len(clk_list)
+        metrics_dict["constraints__clocks__details"] = clk_list
 
-    # CTS
-    # =======================================================================
-    merge_jsons(logPath, metrics_dict, "4_*.json")
+        # Floorplan
+        # =========================================================================
+        merge_jsons(logPath, metrics_dict, "2_*.json")
 
-    # Global Route
-    # =========================================================================
-    merge_jsons(logPath, metrics_dict, "5_*.json")
-    extractTagFromFile(
-        "globalroute__timing__clock__slack",
-        metrics_dict,
-        "^\\[INFO FLW-....\\] Clock .* slack (\\S+)",
-        logPath + "/5_1_grt.log",
-    )
+        # Place
+        # =========================================================================
+        merge_jsons(logPath, metrics_dict, "3_*.json")
 
-    # Finish
-    # =========================================================================
-    merge_jsons(logPath, metrics_dict, "6_*.json")
-    extractTagFromFile(
-        "finish__timing__wns_percent_delay",
-        metrics_dict,
-        baseRegEx.format("finish slack div critical path delay", "(\\S+)"),
-        rptPath + "/6_finish.rpt",
-    )
+        # CTS
+        # =======================================================================
+        (logPath, metrics_dict, "4_*.json")
+
+        # Global Route
+        # =========================================================================
+        merge_jsons(logPath, metrics_dict, "5_*.json")
+        extractTagFromFile(
+            "globalroute__timing__clock__slack",
+            metrics_dict,
+            "^\\[INFO FLW-....\\] Clock .* slack (\\S+)",
+            logPath + "/5_1_grt.log",
+        )
+
+        # Finish
+        # =========================================================================
+        merge_jsons(logPath, metrics_dict, "6_*.json")
+        extractTagFromFile(
+            "finish__timing__wns_percent_delay",
+            metrics_dict,
+            baseRegEx.format("finish slack div critical path delay", "(\\S+)"),
+            rptPath + "/6_finish.rpt",
+        )
 
     extractGnuTime("finish", metrics_dict, logPath + "/6_report.log")
 
