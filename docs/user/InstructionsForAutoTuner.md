@@ -173,7 +173,7 @@ To run an RTL simulation instead of the OpenRoad flow, use the `rtl_sim` options
 The simulation is required to output metrics as defined in the `score_metrics_config` group of the `.json` configuration file. The script parse the stdout output of the simulation, which must contain, for example:
 ```shell
 branch_pred_miss_rate: 0.315149
-percent_cache_miss: 0.71828
+percent_cache_miss: 0.11828
 ```
 
 ## How to use

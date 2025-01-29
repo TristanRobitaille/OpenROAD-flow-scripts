@@ -33,9 +33,13 @@ class TerminalTool(Enum):
 
 # ----- CLASSES ----- #
 class VerilogRewriter():
-    def __init__(self, top_fp:str, pkg_fp:str):
-        self.top_fp = Path(top_fp)
-        self.pkg_fp = Path(pkg_fp)
+    def __init__(self, top_fp: str = None, pkg_fp: str = None): 
+        self.top_fp = None
+        self.pkg_fp = None
+        if top_fp is not None:
+            self.top_fp = Path(top_fp)
+        if pkg_fp is not None:
+            self.pkg_fp = Path(pkg_fp)
         self.top_char_offset_from_insertion = 0
         self.pkg_char_offset_from_insertion = 0
 
@@ -152,5 +156,7 @@ class VerilogRewriter():
         Returns: None
         """
 
-        self._update_file(top_new_def, top_new_params, is_for_pkg=False)
-        self._update_file(pkg_new_def, pkg_new_params, is_for_pkg=True)
+        if self.top_fp is not None:
+            self._update_file(top_new_def, top_new_params, is_for_pkg=False)
+        if self.pkg_fp is not None:
+            self._update_file(pkg_new_def, pkg_new_params, is_for_pkg=True)

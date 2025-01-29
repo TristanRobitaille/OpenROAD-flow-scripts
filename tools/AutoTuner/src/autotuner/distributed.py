@@ -62,7 +62,12 @@ from VerilogRewriter import VerilogRewriter
 
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 ORFS_URL = Path("https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts")
-JSON_FILES_BASE = dict() # Base path for files defined in the .json file
+JSON_FILES_BASE = { # Base path for files defined in the .json file
+    "_SDC_FILE_PATH": None,
+    "_FR_FILE_PATH": None,
+    "_PACKAGE_FILE_PATH": None,
+    "_TOP_LEVEL_FILE_PATH": None,
+}
 METRICS_CONFIG = dict() # Configuration for the metrics used to compute the score for each run
 METRIC = "minimum"
 ERROR_METRIC = 9e99
@@ -126,7 +131,7 @@ class AutoTunerBase(tune.Trainable):
         # We create the following directory structure:
         #      1/     2/         3/       4/                5/   6/
         # <repo>/<logs>/<platform>/<design>/<experiment>-DATE/<id>/<cwd>
-        repo_dir = Path.cwd().parents[5] # Go back 6 levels
+        repo_dir = Path(__file__).resolve().parent / "../../../.."
         self.repo_dir = repo_dir.resolve()
         self.step_ = 0
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
@@ -305,7 +310,8 @@ def copy_repo(repo_dir, copy_dir):
     # Update the file paths in the configuration dictionary
     files = deepcopy(JSON_FILES_BASE)
     for key, filepath in files.items():
-        files[key] = copy_dir / filepath
+        if filepath is not None:
+            files[key] = copy_dir / filepath
 
     return files
 
@@ -435,7 +441,7 @@ def read_config(file_name):
                 print(f"[WARNING TUN-xxx] Field {key} isn't valid for group 'files'. Ignoring it.")
                 continue
 
-            if key in JSON_FILES_BASE.keys():
+            if key in JSON_FILES_BASE.keys() and JSON_FILES_BASE[key] is not None:
                 print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
 
             if filepath == "":
@@ -511,10 +517,10 @@ def read_config(file_name):
         if args.mode == "tune":
             config = apply_condition(config, json_config["parameters"])
 
-        if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
+        if top_param_or_def_found and JSON_FILES_BASE["_TOP_LEVEL_FILE_PATH"] == None:
             print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
             sys.exit(1)
-        if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
+        if package_param_or_def_found and JSON_FILES_BASE["_PACKAGE_FILE_PATH"] == None:
             print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
             sys.exit(1)
 
@@ -586,7 +592,7 @@ def parse_config(config, files):
     }
     flow_variables = parse_flow_variables()
 
-    if "_TOP_LEVEL_FILE_PATH" in files.keys() or "_PACKAGE_FILE_PATH" in files.keys():
+    if files["_TOP_LEVEL_FILE_PATH"] is not None or files["_PACKAGE_FILE_PATH"] is not None:
         verilog_rewriter = VerilogRewriter(top_fp=files["_TOP_LEVEL_FILE_PATH"], pkg_fp=files["_PACKAGE_FILE_PATH"])
 
     for key, value in config.items():
@@ -1316,7 +1322,7 @@ if __name__ == "__main__":
             mode="min",
             num_samples=args.samples,
             fail_fast=False,
-            local_dir=str(BASE_LOCAL_DIR),
+            storage_path=str(BASE_LOCAL_DIR),
             resume=args.resume,
             stop={"training_iteration": args.iterations},
             resources_per_trial={"cpu": args.resources_per_trial},
