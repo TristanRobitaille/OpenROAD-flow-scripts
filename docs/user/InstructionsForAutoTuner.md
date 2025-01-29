@@ -169,12 +169,14 @@ The top-level file to use is specified in the `.json` file with the field  `"_TO
 
 The user can define their metrics used to compute the score of a run. The metrics are defined in the configuration `.json` and the function to compute the score is defined in the `ScoreImprov.get_score()` method. By default, the score is the PPA and is computed using the coefficients shown in the above JSON snippet. The metrics come from the output of the selected OpenRoad flow stage or the RTL simulation.
 
-To run an RTL simulation instead of the OpenRoad flow, use the `rtl_sim` options for the `stage_stop` argument. For this, a file path to an executable simulation (`.py`, `.sh` or a Makefile) is required. If using a `.sh` script, make sure to have the correct execute permissions.
+To run an RTL simulation in addition to the OpenRoad flow, call AutoTuner with the `run_sim` argument. For this, a file path to an executable simulation (`.py`, `.sh` or a Makefile) is required in the `.json` file (under `"_SIM_FILE_PATH"`). If using a `.sh` script, make sure to have the correct execute permissions.
 The simulation is required to output metrics as defined in the `score_metrics_config` group of the `.json` configuration file. The script parse the stdout output of the simulation, which must contain, for example:
 ```shell
 branch_pred_miss_rate: 0.315149
 percent_cache_miss: 0.11828
 ```
+
+You can also avoid running the OpenROAD flow by setting `stage_stop` to `"none"`.
 
 ## How to use
 
@@ -236,7 +238,8 @@ GCP Setup Tutorial coming soon.
 | `--design`                    | Name of the design for Autotuning.                                                                            ||
 | `--platform`                  | Name of the platform for Autotuning.                                                                          ||
 | `--config`                    | Configuration file that sets which knobs to use for Autotuning.                                               ||
-| `--stage_stop`                | Flow stage at which to stop script. May be one of `["rtl_sim", "floorplan", "place", "cts", "route", "all"]`  | all |
+| `--stage_stop`                | Flow stage at which to stop script. May be one of `["floorplan", "place", "cts", "route", "all", "none"]`     | all |
+| `--run_sim`                   | Additionally run an arbitrary (RTL, functional, etc.) simulation to collect additional metrics                | false |
 | `--experiment`                | Experiment name. This parameter is used to prefix the FLOW_VARIANT and to set the Ray log destination.        | test |
 | `--git_clean`                 | Clean binaries and build files. **WARNING**: may lose previous data.                                          ||
 | `--git_clone`                 | Force new git clone. **WARNING**: may lose previous data.                                                     ||

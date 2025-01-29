@@ -33,7 +33,7 @@ class TerminalTool(Enum):
 
 # ----- CLASSES ----- #
 class VerilogRewriter():
-    def __init__(self, top_fp: str = None, pkg_fp: str = None): 
+    def __init__(self, top_fp: str = None, pkg_fp: str = None):
         self.top_fp = None
         self.pkg_fp = None
         if top_fp is not None:
@@ -55,7 +55,7 @@ class VerilogRewriter():
         Return:
         -int: Difference in length between the new text and the old text.
         """
-        
+
         try:
             with open(fp, 'r') as file:
                 content = file.read()

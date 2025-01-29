@@ -67,15 +67,14 @@ JSON_FILES_BASE = { # Base path for files defined in the .json file
     "_FR_FILE_PATH": None,
     "_PACKAGE_FILE_PATH": None,
     "_TOP_LEVEL_FILE_PATH": None,
+    "_SIM_FILE_PATH": None
 }
 METRICS_CONFIG = dict() # Configuration for the metrics used to compute the score for each run
 METRIC = "minimum"
 ERROR_METRIC = 9e99
-# ORFS_FLOW_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../flow"))
 ORFS_FLOW_DIR = Path(__file__).resolve().parent / "../../../../flow"
 ORFS_FLOW_DIR = ORFS_FLOW_DIR.resolve()
-ALLOWED_SIM_STAGES = ["rtl_sim"]
-ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all"]
+ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all", "none"]
 FLOW_METRICS_MAP = {
     "floorplan": {  "total_power"   : ["floorplan", "power__total"],
                     "core_util"     : ["floorplan", "design__instance__utilization"],
@@ -145,15 +144,33 @@ class AutoTunerBase(tune.Trainable):
         """
         Run step experiment and compute its score.
         """
-        metrics_file = ""
-        if args.stage_stop in ALLOWED_SIM_STAGES:
-            metrics_file = run_rtl_sim(self.copy_dir, self.variant, self.files)
-        else:
-            metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
+        log_path = os.getcwd() + "/"
+        report_path = log_path.replace("logs", "reports")
+        run_command(f"mkdir -p {report_path}")
+        run_command(f"mkdir -p {log_path}")
+
+        if args.run_sim:
+            run_rtl_sim(self.copy_dir, self.variant, self.files, log_path)
+        if args.stage_stop != "none":
+            openroad(self.copy_dir, self.parameters, self.variant, log_path)
+
+        metrics_file = os.path.join(report_path, "metrics.json")
+        metrics_command  = f"{self.copy_dir}/flow/util/genMetrics.py -x"
+        metrics_command += f" -v {args.experiment}/{self.variant}"
+        metrics_command += f" -d {args.design}"
+        metrics_command += f" -p {args.platform}"
+        metrics_command += f" -o {metrics_file}"
+        metrics_command += f" -f {self.copy_dir}/flow/"
+
+        run_command( # Collect metrics in .json file
+            metrics_command,
+            stderr_file = Path(log_path) / "error-metrics.log",
+            stdout_file = Path(log_path) / "metrics-stdout.log"
+        )
+
         self.step_ += 1
         score = self.evaluate(self.read_metrics(metrics_file))
-        # Feed the score back to Tune. return must match 'metric' used in tune.run()
-        return {METRIC: score}
+        return {METRIC: score} # Feed the score back to Tune. return must match 'metric' used in tune.run()
 
     def evaluate(self, metrics):
         """
@@ -162,20 +179,22 @@ class AutoTunerBase(tune.Trainable):
         Default evaluation function optimizes effective clock period.
         """
 
-        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+        score = 0
+
+        if args.stage_stop != "none":
             if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
                 return ERROR_METRIC
 
             gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
             score = metrics["clk_period"] - metrics["worst_slack"]
-            score = score * (self.step_ / 100) ** (-1)
+            score = 100 * (score / self.step_)
 
             if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
                 score += gamma * metrics["num_drc"]
-        else: # RTL sim
-            score = 0
+
+        if args.run_sim:
             for metric_name, metric_config in METRICS_CONFIG.items():
-                if metric_name in metrics:
+                if metric_name in metrics and metrics[metric_name] != "N/A":
                     score += metric_config["coeff"] * metrics[metric_name]
         return score
 
@@ -187,7 +206,9 @@ class AutoTunerBase(tune.Trainable):
         with open(file_name) as file:
             data = json.load(file)
 
-        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+        metrics_dict = dict()
+
+        if args.stage_stop != "none":
             metrics_dict = {
                 "clk_period": 9999999,
                 "worst_slack": "N/A",
@@ -203,11 +224,11 @@ class AutoTunerBase(tune.Trainable):
                     stage_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][0]
                     metric_json_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][1]
                     metrics_dict[metric_name] = data[stage_name][metric_json_name]
-        else:
-            metrics_dict = dict()
-            for metric_name, value in data[args.stage_stop].items():
+
+        if args.run_sim:
+            for metric_name, value in data["rtl_sim"].items():
                 metrics_dict[metric_name] = value
-    
+
         return metrics_dict
 
 
@@ -238,10 +259,12 @@ class ScoreImprov(AutoTunerBase):
             for metric_name, metric_data in METRICS_CONFIG.items():
                 score_upper_bound += (100 * metric_data["coeff"])
                 score += (metric_data["coeff"] * collected_metrics[metric_name])
-            
+
             return score_upper_bound, score
 
-        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+        collected_metrics = dict()
+
+        if args.stage_stop != "none":
             assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
             assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
             assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
@@ -260,35 +283,32 @@ class ScoreImprov(AutoTunerBase):
                 "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
             }
 
-            score_upper_bound, score = sum_metrics(collected_metrics)
-            return score
-        else: # RTL sim
-            collected_metrics = dict()
+        if args.run_sim:
             for metric_name, metric_val in metrics.items(): # This assumes that for all metrics, lower is better
                 if metric_name not in reference:
                     print(f"[{TerminalTool.warning}] Metric {metric_name} not found in reference! Exiting.")
                     sys.exit(1)
 
                 collected_metrics[metric_name] = percent(reference[metric_name], metric_val)
-            score_upper_bound, score = sum_metrics(collected_metrics)
-            return score
+
+        score_upper_bound, score = sum_metrics(collected_metrics)
+        return score
 
 
     def evaluate(self, metrics):
-        if args.stage_stop in ALLOWED_OPENROAD_STAGES:
+        if args.stage_stop != "none":
             for metric in FLOW_METRICS_MAP[args.stage_stop].keys():
                 if metrics[metric] == "N/A" or reference[metric] == "N/A":
                     return ERROR_METRIC
 
-            score = self.get_score(metrics)
-            score_normalized = score * (self.step_ / 100) ** (-1)
-            if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
-                gamma = score / 10
-                score_normalized += gamma * metrics["num_drc"]
-        else: # RTL sim
-            score = self.get_score(metrics)
-            score_normalized = score * (self.step_ / 100) ** (-1)
-        return score
+        score = self.get_score(metrics)
+        score_normalized = 100 * (score / self.step_)
+
+        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+            gamma = score / 10
+            score_normalized += gamma * metrics["num_drc"]
+
+        return score_normalized
 
 
 def copy_repo(repo_dir, copy_dir):
@@ -432,7 +452,7 @@ def read_config(file_name):
             print(f"[ERROR TUN-0020] FR file (key '_FR_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
-        if args.stage_stop in ALLOWED_SIM_STAGES and "_SIM_FILE_PATH" not in json_config["files"].keys():
+        if args.run_sim and "_SIM_FILE_PATH" not in json_config["files"].keys():
             print(f"[ERROR TUN-0020] Simulation file (key '_SIM_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
@@ -487,8 +507,8 @@ def read_config(file_name):
             if key == "best_result":
                 continue
 
-            # For RTL simulation, only consider parameters starting with _TOP or _PACKAGE
-            if args.stage_stop in ALLOWED_SIM_STAGES and not (key.startswith("_TOP") or key.startswith("_PACKAGE")):
+            # If we're not running any OpenROAD stage, ignore all non-RTL parameters
+            if args.stage_stop == "none" and not (key.startswith("_TOP") or key.startswith("_PACKAGE")):
                 continue
 
             top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
@@ -623,6 +643,7 @@ def parse_config(config, files):
         verilog_rewriter.update_sv(prefix_dicts["_TOP_DEF_"], prefix_dicts["_TOP_PARAM_"], prefix_dicts["_PACKAGE_DEF_"], prefix_dicts["_PACKAGE_PARAM_"])
     return options
 
+
 def write_sdc(variables, sdc_file_path):
     """
     Create a SDC file with parameters for current tuning iteration.
@@ -734,25 +755,21 @@ def openroad_distributed(repo_dir, base_log_dir, config):
     files = copy_repo(repo_dir, copy_dir)
     config = parse_config(config, files)
     os.chdir(copy_dir)
-    openroad(copy_dir, config, str(uuid()))
+    if args.stage_stop != "none":
+        openroad(copy_dir, config, str(uuid()))
+
+    # TODO: THIS IS VERY INCOMPLETE. NEED TO RUN BOTH FLOW AND RTL SIMULATION AND RUN GENMETRICS. LOOK AT .step() METHOD.
+    # TODO: TEST THAT EVERYTHING WORKS WELL.
 
 
-def openroad(base_dir, parameters, flow_variant):
+def openroad(base_dir, parameters, flow_variant, log_path):
     """
     Run OpenROAD-flow-scripts with a given set of parameters.
     """
-    # Make sure path ends in a slash, i.e., is a folder
-    flow_variant = f"{args.experiment}/{flow_variant}"
-    log_path = os.getcwd() + "/"
-    report_path = log_path.replace("logs", "reports")
-    run_command(f"mkdir -p {log_path}")
-    run_command(f"mkdir -p {report_path}")
+    make_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
+    make_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
+    make_command += " && "
 
-    export_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
-    export_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
-    export_command += " && "
-
-    make_command = export_command
     make_command += f"make"
     if args.stage_stop != "all":
         for i in range (ALLOWED_OPENROAD_STAGES.index(args.stage_stop) + 1):
@@ -760,7 +777,7 @@ def openroad(base_dir, parameters, flow_variant):
     make_command += f" -C {base_dir}/flow DESIGN_CONFIG=designs/"
     make_command += f"{args.platform}/{args.design}/config.mk"
     make_command += f" PLATFORM={args.platform}"
-    make_command += f" FLOW_VARIANT={flow_variant} {parameters}"
+    make_command += f" FLOW_VARIANT={args.experiment}/{flow_variant} {parameters}"
     make_command += f" EQUIVALENCE_CHECK=0"
     make_command += f" NPROC={args.openroad_threads} SHELL=bash"
     run_command(f"cd {base_dir}")
@@ -771,35 +788,16 @@ def openroad(base_dir, parameters, flow_variant):
         stdout_file = Path(log_path) / "make-finish-stdout.log"
     )
 
-    metrics_file = os.path.join(report_path, "metrics.json")
-    metrics_command = export_command
-    metrics_command += f"{base_dir}/flow/util/genMetrics.py -x"
-    metrics_command += f" -v {flow_variant}"
-    metrics_command += f" -d {args.design}"
-    metrics_command += f" -p {args.platform}"
-    metrics_command += f" -o {metrics_file}"
-    run_command(
-        metrics_command,
-        stderr_file = Path(log_path) / "error-metrics.log",
-        stdout_file = Path(log_path) / "metrics-stdout.log"
-    )
 
-    return metrics_file
-
-def run_rtl_sim(base_dir, flow_variant, files):
+def run_rtl_sim(base_dir, flow_variant, files, log_path):
     """
     Runs the simulation and returns the path to the metrics file.
     """
 
-    flow_variant = f"{args.experiment}/{flow_variant}"
-    log_path = os.getcwd() + "/"
-    report_path = log_path.replace("logs", "reports")
     sim_report_path = base_dir / "flow" / "reports"
     sim_file_path = files["_SIM_FILE_PATH"]
-    
-    run_command(f"mkdir -p {log_path}")
-    run_command(f"mkdir -p {sim_report_path}")
 
+    run_command(f"mkdir -p {sim_report_path}")
     rtl_sim_command = ""
 
     if sim_file_path.suffix == ".py":
@@ -821,21 +819,6 @@ def run_rtl_sim(base_dir, flow_variant, files):
     with open(metrics_names_file, "w") as file:
         json.dump(METRICS_CONFIG, file, indent=2)
 
-    metrics_file = sim_report_path / "metrics.json"
-    metrics_command = f"{base_dir}/flow/util/genMetrics.py -x"
-    metrics_command += f" -v {flow_variant}"
-    metrics_command += f" -d {args.design}"
-    metrics_command += f" -p {args.platform}"
-    metrics_command += f" -o {metrics_file}"
-    run_command(
-        metrics_command,
-        stderr_file = Path(log_path) / "error-metrics.log",
-        stdout_file = Path(log_path) / "metrics-stdout.log"
-    )
-
-    os.remove(metrics_names_file) # Cleanup metrics name file
-
-    return metrics_file
 
 def clone(path):
     """
@@ -1095,10 +1078,16 @@ def parse_arguments():
     parser.add_argument(
         "--stage_stop",
         type=str,
-        metavar="<all, floorplan, place, cts, route, rtl_sim...>",
+        metavar="<all, floorplan, place, cts, route, none>",
         default="all",
         help="Stage at which to stop the flow and use for metrics.",
-        choices=ALLOWED_OPENROAD_STAGES + ALLOWED_SIM_STAGES
+        choices=ALLOWED_OPENROAD_STAGES
+    )
+
+    parser.add_argument(
+        "--run_sim",
+        action="store_true",
+        help="Run a RTL or functional simulation for additional metrics.",
     )
 
     arguments = parser.parse_args()
@@ -1339,7 +1328,7 @@ if __name__ == "__main__":
         if args.algorithm != "ax":
             tune_args["config"] = config_dict
 
-        analysis = tune.run(TrainClass, **tune_args)            
+        analysis = tune.run(TrainClass, **tune_args)
 
         task_id = save_best.remote(analysis)
         _ = ray.get(task_id)
