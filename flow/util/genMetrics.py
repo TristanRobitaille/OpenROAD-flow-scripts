@@ -136,6 +136,21 @@ def extractTagFromFile(
         print("[ERROR] Failed to open file:", searchFilePath)
         jsonFile[jsonTag] = "ERR"
 
+def extractRtlSimMetrics(jsonFile, simLogFile, metricsNameFile):
+    """Extract metrics from RTL simulation log file and returns whether the file was found."""
+    if os.path.isfile(simLogFile):
+        with open(metricsNameFile, "r") as file:
+            metricsToExtract = json.load(file)
+
+        for metric_name in metricsToExtract.keys():
+            extractTagFromFile(
+                f"rtl_sim__{metric_name}",
+                jsonFile,
+                f"{metric_name}: +(\\S+)",
+                simLogFile,
+            )
+        return True
+    return False
 
 def extractGnuTime(prefix, jsonFile, file):
     if not os.path.isfile(file):
@@ -203,6 +218,7 @@ def is_git_repo(folder=None):
 
 def merge_jsons(root_path, output, files):
     paths = sorted(glob(os.path.join(root_path, files)))
+    print(f"TR paths: {paths}")
     for path in paths:
         file = open(path, "r")
         data = json.load(file)
@@ -214,6 +230,7 @@ def extract_metrics(cwd, platform, design, flow_variant, output, hier_json):
     baseRegEx = "^{}\n^-*\n^{}"
 
     logPath = os.path.join(cwd, "logs", platform, design, flow_variant)
+    print(f"TR logPath: {logPath}")
     rptPath = os.path.join(cwd, "reports", platform, design, flow_variant)
     resultPath = os.path.join(cwd, "results", platform, design, flow_variant)
 
@@ -250,9 +267,16 @@ def extract_metrics(cwd, platform, design, flow_variant, output, hier_json):
     metrics_dict["run__flow__platform_commit"] = cmdOutput
     metrics_dict["run__flow__variant"] = flow_variant
 
+    # RTL sim
+    # =========================================================================
+    running_rtl_sim = extractRtlSimMetrics(
+        metrics_dict,
+        "./reports/rtl_sim-stdout.log",
+        "./reports/rtl_sim_metrics_names.json"
+    )
+
     # Synthesis
     # =========================================================================
-
     extractTagFromFile(
         "synth__design__instance__count__stdcell",
         metrics_dict,
@@ -276,6 +300,7 @@ def extract_metrics(cwd, platform, design, flow_variant, output, hier_json):
     # Floorplan
     # =========================================================================
     merge_jsons(logPath, metrics_dict, "2_*.json")
+    print(f"TR metrics_dict: {metrics_dict}")
 
     # Place
     # =========================================================================
@@ -283,7 +308,7 @@ def extract_metrics(cwd, platform, design, flow_variant, output, hier_json):
 
     # CTS
     # =======================================================================
-    merge_jsons(logPath, metrics_dict, "4_*.json")
+    (logPath, metrics_dict, "4_*.json")
 
     # Global Route
     # =========================================================================

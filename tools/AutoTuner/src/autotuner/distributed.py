@@ -33,6 +33,7 @@ import sys
 import glob
 import subprocess
 import random
+from pathlib import Path
 from copy import deepcopy
 from datetime import datetime
 from multiprocessing import cpu_count
@@ -60,18 +61,21 @@ from ax.service.ax_client import AxClient
 from VerilogRewriter import VerilogRewriter
 
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
-FASTROUTE_TCL = "fastroute.tcl"
-CONSTRAINTS_SDC = "constraint.sdc"
-JSON_FILES_BASE = dict() # Base path for files defined in the .json file
+ORFS_URL = Path("https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts")
+JSON_FILES_BASE = { # Base path for files defined in the .json file
+    "_SDC_FILE_PATH": None,
+    "_FR_FILE_PATH": None,
+    "_PACKAGE_FILE_PATH": None,
+    "_TOP_LEVEL_FILE_PATH": None,
+    "_SIM_FILE_PATH": None
+}
 METRICS_CONFIG = dict() # Configuration for the metrics used to compute the score for each run
 METRIC = "minimum"
 ERROR_METRIC = 9e99
-ORFS_FLOW_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../../../../flow")
-)
-ALLOWED_STAGES = ["floorplan", "place", "cts", "route", "all"]
-METRICS_MAP = {
+ORFS_FLOW_DIR = Path(__file__).resolve().parent / "../../../../flow"
+ORFS_FLOW_DIR = ORFS_FLOW_DIR.resolve()
+ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all", "none"]
+FLOW_METRICS_MAP = {
     "floorplan": {  "total_power"   : ["floorplan", "power__total"],
                     "core_util"     : ["floorplan", "design__instance__utilization"],
                     "worst_slack"   : ["floorplan", "timing__setup__ws"]},
@@ -126,25 +130,47 @@ class AutoTunerBase(tune.Trainable):
         # We create the following directory structure:
         #      1/     2/         3/       4/                5/   6/
         # <repo>/<logs>/<platform>/<design>/<experiment>-DATE/<id>/<cwd>
-        repo_dir = os.getcwd() + "/../" * 6
-        self.repo_dir = os.path.abspath(repo_dir)
+        repo_dir = Path(__file__).resolve().parent / "../../../.."
+        self.repo_dir = repo_dir.resolve()
         self.step_ = 0
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
-        self.copy_dir = os.getcwd() + f"/{self.variant}"
+        self.copy_dir = Path.cwd() / self.variant
 
-        files = copy_repo(self.repo_dir, self.copy_dir)
+        self.files = copy_repo(self.repo_dir, self.copy_dir)
 
-        self.parameters = parse_config(config, files)
+        self.parameters = parse_config(config, self.files)
 
     def step(self):
         """
         Run step experiment and compute its score.
         """
-        metrics_file = openroad(self.copy_dir, self.parameters, self.variant)
+        log_path = os.getcwd() + "/"
+        report_path = log_path.replace("logs", "reports")
+        run_command(f"mkdir -p {report_path}")
+        run_command(f"mkdir -p {log_path}")
+
+        if args.run_sim:
+            run_rtl_sim(self.copy_dir, self.variant, self.files, log_path)
+        if args.stage_stop != "none":
+            openroad(self.copy_dir, self.parameters, self.variant, log_path)
+
+        metrics_file = os.path.join(report_path, "metrics.json")
+        metrics_command  = f"{self.copy_dir}/flow/util/genMetrics.py -x"
+        metrics_command += f" -v {args.experiment}/{self.variant}"
+        metrics_command += f" -d {args.design}"
+        metrics_command += f" -p {args.platform}"
+        metrics_command += f" -o {metrics_file}"
+        metrics_command += f" -f {self.copy_dir}/flow/"
+
+        run_command( # Collect metrics in .json file
+            metrics_command,
+            stderr_file = Path(log_path) / "error-metrics.log",
+            stdout_file = Path(log_path) / "metrics-stdout.log"
+        )
+
         self.step_ += 1
         score = self.evaluate(self.read_metrics(metrics_file))
-        # Feed the score back to Tune. return must match 'metric' used in tune.run()
-        return {METRIC: score}
+        return {METRIC: score} # Feed the score back to Tune. return must match 'metric' used in tune.run()
 
     def evaluate(self, metrics):
         """
@@ -153,15 +179,23 @@ class AutoTunerBase(tune.Trainable):
         Default evaluation function optimizes effective clock period.
         """
 
-        if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
-            return ERROR_METRIC
+        score = 0
 
-        gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
-        score = metrics["clk_period"] - metrics["worst_slack"]
-        score = score * (self.step_ / 100) ** (-1)
+        if args.stage_stop != "none":
+            if metrics["clk_period"] == "N/A" or metrics["worst_slack"] == "N/A":
+                return ERROR_METRIC
 
-        if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
-            score += gamma * metrics["num_drc"]
+            gamma = (metrics["clk_period"] - metrics["worst_slack"]) / 10
+            score = metrics["clk_period"] - metrics["worst_slack"]
+            score = 100 * (score / self.step_)
+
+            if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
+                score += gamma * metrics["num_drc"]
+
+        if args.run_sim:
+            for metric_name, metric_config in METRICS_CONFIG.items():
+                if metric_name in metrics and metrics[metric_name] != "N/A":
+                    score += metric_config["coeff"] * metrics[metric_name]
         return score
 
     @classmethod
@@ -172,33 +206,37 @@ class AutoTunerBase(tune.Trainable):
         with open(file_name) as file:
             data = json.load(file)
 
-        metrics_dict = {
-            "clk_period": 9999999,
-            "worst_slack": "N/A",
-            "wirelength": "N/A",
-            "num_drc": "N/A",
-            "total_power": "N/A",
-            "core_util": "N/A",
-        }
+        metrics_dict = dict()
 
-        if len(data["constraints"]["clocks__details"]) > 0:
-            metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
+        if args.stage_stop != "none":
+            metrics_dict = {
+                "clk_period": 9999999,
+                "worst_slack": "N/A",
+                "wirelength": "N/A",
+                "num_drc": "N/A",
+                "total_power": "N/A",
+                "core_util": "N/A",
+            }
+            if len(data["constraints"]["clocks__details"]) > 0:
+                metrics_dict["clk_period"] = float(data["constraints"]["clocks__details"][0].split()[1])
+            for metric_name in metrics_dict.keys():
+                if metric_name in FLOW_METRICS_MAP[args.stage_stop].keys():
+                    stage_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][0]
+                    metric_json_name = FLOW_METRICS_MAP[args.stage_stop][metric_name][1]
+                    metrics_dict[metric_name] = data[stage_name][metric_json_name]
 
-        for metric_name in metrics_dict.keys():
-            if metric_name in METRICS_MAP[args.stage_stop].keys():
-                stage_name = METRICS_MAP[args.stage_stop][metric_name][0]
-                metric_json_name = METRICS_MAP[args.stage_stop][metric_name][1]
-                metrics_dict[metric_name] = data[stage_name][metric_json_name]
+        if args.run_sim:
+            for metric_name, value in data["rtl_sim"].items():
+                metrics_dict[metric_name] = value
 
         return metrics_dict
 
 
-class PPAImprov(AutoTunerBase):
+class ScoreImprov(AutoTunerBase):
     """
-    Extends AutoTunerBase to improve PPA (Performance, Power, Area) metrics.
+    Extends AutoTunerBase to improve score metrics.
 
-    This class overrides the evaluation method to compute a PPA score,
-    which combines performance, power, and area metrics to optimize the design.
+    This class overrides the evaluation method to compute a score.
     It uses a reference configuration to compare and compute the improvements.
     Users are invited to modify the get_score function to suit their specific needs.
     """
@@ -206,51 +244,71 @@ class PPAImprov(AutoTunerBase):
     @classmethod
     def get_score(cls, metrics):
         """
-        Compute PPA term for evaluate.
+        Compute score term for evaluate.
         """
 
-        assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
-        assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
-        assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
-
-        eff_clk_period = metrics["clk_period"]
-        if metrics["worst_slack"] < 0:
-            eff_clk_period -= metrics["worst_slack"]
-
-        eff_clk_period_ref = reference["clk_period"]
-        if reference["worst_slack"] < 0:
-            eff_clk_period_ref -= reference["worst_slack"]
-
         def percent(x_1, x_2):
-            return (x_1 - x_2) / x_1 * 100
+            return 100 * (x_1 - x_2) / x_1
 
-        collected_metrics = {
-            "performance": percent(eff_clk_period_ref, eff_clk_period),
-            "power": percent(reference["total_power"], metrics["total_power"]),
-            "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
-        }
+        def sum_metrics(collected_metrics):
+            """
+            Compute the sum of all metrics * coefficient.
+            Lower values of score are better.
+            """
+            score_upper_bound, score = 0, 0
+            for metric_name, metric_data in METRICS_CONFIG.items():
+                score_upper_bound += (100 * metric_data["coeff"])
+                score += (metric_data["coeff"] * collected_metrics[metric_name])
 
-        # Lower values of PPA are better.
-        score_upper_bound, score = 0, 0
-        for metric_name, metric_data in METRICS_CONFIG.items():
-            score_upper_bound += (100 * metric_data["coeff"])
-            score += (metric_data["coeff"] * collected_metrics[metric_name])
+            return score_upper_bound, score
 
-        return (score_upper_bound - score)
+        collected_metrics = dict()
+
+        if args.stage_stop != "none":
+            assert (metrics["clk_period"] != "N/A" and metrics["worst_slack"] != "N/A")
+            assert (metrics["total_power"] != "N/A" and metrics["total_power"] != "N/A")
+            assert (metrics["core_util"] != "N/A" and metrics["core_util"] != "N/A")
+
+            eff_clk_period = metrics["clk_period"]
+            if metrics["worst_slack"] < 0:
+                eff_clk_period -= metrics["worst_slack"]
+
+            eff_clk_period_ref = reference["clk_period"]
+            if reference["worst_slack"] < 0:
+                eff_clk_period_ref -= reference["worst_slack"]
+
+            collected_metrics = {
+                "performance": percent(eff_clk_period_ref, eff_clk_period),
+                "power": percent(reference["total_power"], metrics["total_power"]),
+                "area": percent(100 - reference["core_util"], 100 - metrics["core_util"]),
+            }
+
+        if args.run_sim:
+            for metric_name, metric_val in metrics.items(): # This assumes that for all metrics, lower is better
+                if metric_name not in reference:
+                    print(f"[{TerminalTool.warning}] Metric {metric_name} not found in reference! Exiting.")
+                    sys.exit(1)
+
+                collected_metrics[metric_name] = percent(reference[metric_name], metric_val)
+
+        score_upper_bound, score = sum_metrics(collected_metrics)
+        return score
+
 
     def evaluate(self, metrics):
-        expected_metrics = METRICS_MAP[args.stage_stop].keys()
-        for metric in expected_metrics:
-            if metrics[metric] == "N/A" or reference[metric] == "N/A":
-                return ERROR_METRIC
+        if args.stage_stop != "none":
+            for metric in FLOW_METRICS_MAP[args.stage_stop].keys():
+                if metrics[metric] == "N/A" or reference[metric] == "N/A":
+                    return ERROR_METRIC
 
-        ppa = self.get_score(metrics)
-        score = ppa * (self.step_ / 100) ** (-1)
+        score = self.get_score(metrics)
+        score_normalized = 100 * (score / self.step_)
+
         if args.stage_stop == "route" or args.stage_stop == "all": # DRC errors are only available in route stage
-            gamma = ppa / 10
-            score += gamma * metrics["num_drc"]
+            gamma = score / 10
+            score_normalized += gamma * metrics["num_drc"]
 
-        return score
+        return score_normalized
 
 
 def copy_repo(repo_dir, copy_dir):
@@ -261,22 +319,19 @@ def copy_repo(repo_dir, copy_dir):
     # Make list of patterns to ignore when copying the repo to reduce the size of the copy
     dont_copy = ["logs", "reports", "results", "objects", "docs"]
     for pattern, directory in [(args.platform, "platforms"), (args.platform, "designs"), (args.design, "designs/src")]:
-        target_dir = f"{ORFS_FLOW_DIR}/{directory}"
+        target_dir = ORFS_FLOW_DIR / directory
         all_patterns = [d for d in os.listdir(target_dir)
                         if os.path.isdir(os.path.join(target_dir, d))]
         other_patterns = [p for p in all_patterns if (p != pattern and p != "src" and p != "common")]
         dont_copy.extend(other_patterns)
 
-    shutil.copytree(repo_dir, copy_dir, ignore=shutil.ignore_patterns(*dont_copy))
+    shutil.copytree(str(repo_dir), str(copy_dir), ignore=shutil.ignore_patterns(*dont_copy))
 
     # Update the file paths in the configuration dictionary
     files = deepcopy(JSON_FILES_BASE)
-    files["_SDC_FILE_PATH"] = f"{copy_dir}/{files['_SDC_FILE_PATH']}"
-    files["_FR_FILE_PATH"] = f"{copy_dir}/{files['_FR_FILE_PATH']}"
-    if "_TOP_LEVEL_FILE_PATH" in files.keys():
-        files["_TOP_LEVEL_FILE_PATH"] = f"{copy_dir}/{files['_TOP_LEVEL_FILE_PATH']}"
-    if "_PACKAGE_FILE_PATH" in files.keys():
-        files["_PACKAGE_FILE_PATH"] = f"{copy_dir}/{files['_PACKAGE_FILE_PATH']}"
+    for key, filepath in files.items():
+        if filepath is not None:
+            files[key] = copy_dir / filepath
 
     return files
 
@@ -397,20 +452,27 @@ def read_config(file_name):
             print(f"[ERROR TUN-0020] FR file (key '_FR_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
+        if args.run_sim and "_SIM_FILE_PATH" not in json_config["files"].keys():
+            print(f"[ERROR TUN-0020] Simulation file (key '_SIM_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
         for key, filepath in json_config["files"].items():
             if "_FILE_PATH" not in key:
                 print(f"[WARNING TUN-xxx] Field {key} isn't valid for group 'files'. Ignoring it.")
                 continue
 
+            if key in JSON_FILES_BASE.keys() and JSON_FILES_BASE[key] is not None:
+                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+
             if filepath == "":
                 print(f"[WARNING TUN-xxx] Value for key {key} in the 'files' group is blank. Ignoring it.")
                 continue
 
-            if key in JSON_FILES_BASE.keys():
-                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+            filepath = Path(filepath)
 
-            full_path = f"{os.path.dirname(file_name)}/{filepath}"
-            JSON_FILES_BASE[key] = full_path.split("OpenROAD-flow-scripts/")[1]
+            base_dir = Path(file_name).parent
+            full_path = base_dir / Path(filepath)
+            JSON_FILES_BASE[key] = Path(str(full_path).partition("OpenROAD-flow-scripts/")[2])
 
     def parse_metrics(json_config):
         """
@@ -445,6 +507,10 @@ def read_config(file_name):
             if key == "best_result":
                 continue
 
+            # If we're not running any OpenROAD stage, ignore all non-RTL parameters
+            if args.stage_stop == "none" and not (key.startswith("_TOP") or key.startswith("_PACKAGE")):
+                continue
+
             top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
             package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
 
@@ -471,10 +537,10 @@ def read_config(file_name):
         if args.mode == "tune":
             config = apply_condition(config, json_config["parameters"])
 
-        if top_param_or_def_found and "_TOP_LEVEL_FILE_PATH" not in JSON_FILES_BASE.keys():
+        if top_param_or_def_found and JSON_FILES_BASE["_TOP_LEVEL_FILE_PATH"] == None:
             print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
             sys.exit(1)
-        if package_param_or_def_found and "_PACKAGE_FILE_PATH" not in JSON_FILES_BASE.keys():
+        if package_param_or_def_found and JSON_FILES_BASE["_PACKAGE_FILE_PATH"] == None:
             print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
             sys.exit(1)
 
@@ -505,25 +571,25 @@ def parse_flow_variables():
     Output:
     - flow_variables: set of flow variables
     """
-    cur_path = os.path.dirname(os.path.realpath(__file__))
 
     # first, generate vars.tcl
-    makefile_path = os.path.join(cur_path, "../../../../flow/")
-    initial_path = os.path.abspath(os.getcwd())
+    cur_path = Path(__file__).resolve().parent
+    makefile_path = cur_path / "../../../../flow/"
+    initial_path = Path.cwd()
     os.chdir(makefile_path)
     result = subprocess.run(["make", "vars", f"PLATFORM={args.platform}"])
     if result.returncode != 0:
         print(f"[ERROR TUN-0018] Makefile failed with error code {result.returncode}.")
         sys.exit(1)
-    if not os.path.exists("vars.tcl"):
+    if not Path("vars.tcl").is_file():
         print(f"[ERROR TUN-0019] Makefile did not generate vars.tcl.")
         sys.exit(1)
     os.chdir(initial_path)
 
     # for code parsing, you need to parse from both scripts and vars.tcl file.
     pattern = r"(?:::)?env\((.*?)\)"
-    files = glob.glob(os.path.join(cur_path, "../../../../flow/scripts/*.tcl"))
-    files.append(os.path.join(cur_path, "../../../../flow/vars.tcl"))
+    files = glob.glob(str(cur_path / "../../../../flow/scripts/*.tcl"))
+    files.append(str(cur_path / "../../../../flow/vars.tcl"))
     variables = set()
     for file in files:
         with open(file) as fp:
@@ -539,39 +605,27 @@ def parse_config(config, files):
     Parse configuration received from tune into make variables.
     """
     options = ""
-    sdc, fast_route, top_params, top_defines, pkg_params, pkg_defines = {}, {}, {}, {}, {}, {}
+    prefix_dicts = {
+        "_FR_": dict(), "_SDC_": dict(),
+        "_TOP_PARAM_": dict(), "_TOP_DEF_": dict(),
+        "_PACKAGE_PARAM_": dict(), "_PACKAGE_DEF_": dict()
+    }
     flow_variables = parse_flow_variables()
-    if "_TOP_LEVEL_FILE_PATH" in files.keys() and "_PACKAGE_FILE_PATH" in files.keys():
+
+    if files["_TOP_LEVEL_FILE_PATH"] is not None or files["_PACKAGE_FILE_PATH"] is not None:
         verilog_rewriter = VerilogRewriter(top_fp=files["_TOP_LEVEL_FILE_PATH"], pkg_fp=files["_PACKAGE_FILE_PATH"])
+
     for key, value in config.items():
-        # Keys that begin with underscore need special handling.
         if key.startswith("_"):
-            # Variables to be injected into fastroute.tcl
-            if key.startswith("_FR_"):
-                fast_route[key.replace("_FR_", "", 1)] = value
-            # Variables to be injected into constraints.sdc
-            elif key.startswith("_SDC_"):
-                sdc[key.replace("_SDC_", "", 1)] = value
-            elif key.startswith("_TOP_PARAM_"):
-                top_params[key.replace("_TOP_PARAM_", "", 1)] = value
-            elif key.startswith("_TOP_DEF_"):
-                top_defines[key.replace("_TOP_DEF_", "", 1)] = value
-            elif key.startswith("_PACKAGE_PARAM_"):
-                pkg_params[key.replace("_PACKAGE_PARAM_", "", 1)] = value
-            elif key.startswith("_PACKAGE_DEF_"):
-                pkg_defines[key.replace("_PACKAGE_DEF_", "", 1)] = value
-            # Special substitution cases
-            elif key == "_PINS_DISTANCE":
+            prefix = next((p for p in prefix_dicts if key.startswith(p)), None)
+            if prefix:
+                prefix_dicts[prefix][key.replace(prefix, "", 1)] = value
+            elif key == "_PINS_DISTANCE": # Special substitution
                 options += f' PLACE_PINS_ARGS="-min_distance {value}"'
-            elif key == "_SYNTH_FLATTEN":
-                print(
-                    "[WARNING TUN-0013] Non-flatten the designs are not "
-                    "fully supported, ignoring _SYNTH_FLATTEN parameter."
-                )
-        # Default case is VAR=VALUE
+            elif key == "_SYNTH_FLATTEN": # Special substitution
+                print("[WARNING TUN-0013] Non-flatten the designs are not fully supported, ignoring _SYNTH_FLATTEN parameter.")
         else:
-            # FIXME there is no robust way to get this metainformation from
-            # ORFS about the variables, so disable this code for now.
+            # FIXME there is no robust way to get this metainformation from ORFS about the variables, so disable this code for now.
 
             # Sanity check: ignore all flow variables that are not tunable
             # if key not in flow_variables:
@@ -579,14 +633,14 @@ def parse_config(config, files):
             #     sys.exit(1)
             options += f" {key}={value}"
 
-    if bool(sdc):
-        write_sdc(sdc, files["_SDC_FILE_PATH"])
+    if prefix_dicts["_SDC_"]:
+        write_sdc(prefix_dicts["_SDC_"], files["_SDC_FILE_PATH"])
         options += f" SDC_FILE={files['_SDC_FILE_PATH']}"
-    if bool(fast_route):
-        write_fast_route(fast_route, files["_FR_FILE_PATH"])
+    if prefix_dicts["_FR_"]:
+        write_fast_route(prefix_dicts["_FR_"], files["_FR_FILE_PATH"])
         options += f" FASTROUTE_TCL={files['_FR_FILE_PATH']}"
-    if bool(top_defines) or bool(top_params) or bool(pkg_defines) or bool(pkg_params):
-        verilog_rewriter.update_sv(top_defines, top_params, pkg_defines, pkg_params)
+    if prefix_dicts["_TOP_PARAM_"] or prefix_dicts["_TOP_DEF_"] or prefix_dicts["_PACKAGE_PARAM_"] or prefix_dicts["_PACKAGE_DEF_"]:
+        verilog_rewriter.update_sv(prefix_dicts["_TOP_DEF_"], prefix_dicts["_TOP_PARAM_"], prefix_dicts["_PACKAGE_DEF_"], prefix_dicts["_PACKAGE_PARAM_"])
     return options
 
 
@@ -595,9 +649,8 @@ def write_sdc(variables, sdc_file_path):
     Create a SDC file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist
-    if not os.path.isfile(sdc_file_path):
+    if not sdc_file_path.is_file():
         print("[ERROR TUN-0020] No SDC reference file provided.")
-        sys.exit(1)
 
     with open(sdc_file_path, "r") as file:
         sdc_content = file.read()
@@ -632,7 +685,7 @@ def write_sdc(variables, sdc_file_path):
                 )
             else:
                 sdc_content += f"\nset io_delay {value}\n"
-    with open(sdc_file_path, "w") as file:
+    with sdc_file_path.open("w") as file:
         file.write(sdc_content)
 
 
@@ -641,10 +694,10 @@ def write_fast_route(variables, fr_file_path):
     Create a FastRoute Tcl file with parameters for current tuning iteration.
     """
     # Handle case where the reference file does not exist (asap7 doesn't have reference)
-    if not os.path.isfile(fr_file_path):
+    if not fr_file_path.is_file():
         print("[ERROR TUN-0020] No FastRoute Tcl reference file provided.")
         sys.exit(1)
-    with open(fr_file_path, "r") as file:
+    with fr_file_path.open("r") as file:
         fr_content = file.read()
 
     if fr_content == "" and args.platform != "asap7":
@@ -668,7 +721,7 @@ def write_fast_route(variables, fr_file_path):
                 fr_content += f"\n{layer_cmd} {layer} {value}\n"
         elif key == "GR_SEED":
             fr_content += f"\nset_global_routing_random -seed {value}\n"
-    with open(fr_file_path, "w") as file:
+    with fr_file_path.open("w") as file:
         file.write(fr_content)
 
 
@@ -698,61 +751,73 @@ def run_command(cmd, timeout=None, stderr_file=None, stdout_file=None, fail_fast
 @ray.remote
 def openroad_distributed(repo_dir, base_log_dir, config):
     """Simple wrapper to run openroad distributed with Ray."""
-    copy_dir = base_log_dir + f"/variant-{uuid()}"
+    copy_dir = base_log_dir / Path(f"/variant-{uuid()}")
     files = copy_repo(repo_dir, copy_dir)
     config = parse_config(config, files)
     os.chdir(copy_dir)
-    openroad(copy_dir, config, str(uuid()))
+    if args.stage_stop != "none":
+        openroad(copy_dir, config, str(uuid()))
+
+    # TODO: THIS IS VERY INCOMPLETE. NEED TO RUN BOTH FLOW AND RTL SIMULATION AND RUN GENMETRICS. LOOK AT .step() METHOD.
+    # TODO: TEST THAT EVERYTHING WORKS WELL.
 
 
-def openroad(base_dir, parameters, flow_variant):
+def openroad(base_dir, parameters, flow_variant, log_path):
     """
     Run OpenROAD-flow-scripts with a given set of parameters.
     """
-    # Make sure path ends in a slash, i.e., is a folder
-    flow_variant = f"{args.experiment}/{flow_variant}"
-    log_path = os.getcwd() + "/"
-    report_path = log_path.replace("logs", "reports")
-    run_command(f"mkdir -p {log_path}")
-    run_command(f"mkdir -p {report_path}")
+    make_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
+    make_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
+    make_command += " && "
 
-    export_command = f"export PATH={BASE_INSTALL_PATH}/OpenROAD/bin"
-    export_command += f":{BASE_INSTALL_PATH}/yosys/bin:$PATH"
-    export_command += " && "
-
-    make_command = export_command
     make_command += f"make"
     if args.stage_stop != "all":
-        for i in range (ALLOWED_STAGES.index(args.stage_stop) + 1):
-            make_command += f" {ALLOWED_STAGES[i]}" # Append preceding flow stages to make command
+        for i in range (ALLOWED_OPENROAD_STAGES.index(args.stage_stop) + 1):
+            make_command += f" {ALLOWED_OPENROAD_STAGES[i]}" # Append preceding flow stages to make command
     make_command += f" -C {base_dir}/flow DESIGN_CONFIG=designs/"
     make_command += f"{args.platform}/{args.design}/config.mk"
     make_command += f" PLATFORM={args.platform}"
-    make_command += f" FLOW_VARIANT={flow_variant} {parameters}"
+    make_command += f" FLOW_VARIANT={args.experiment}/{flow_variant} {parameters}"
     make_command += f" EQUIVALENCE_CHECK=0"
     make_command += f" NPROC={args.openroad_threads} SHELL=bash"
     run_command(f"cd {base_dir}")
     run_command(
         make_command,
         timeout=args.timeout,
-        stderr_file=f"{log_path}error-make-finish.log",
-        stdout_file=f"{log_path}make-finish-stdout.log",
+        stderr_file = Path(log_path) / "error-make-finish.log",
+        stdout_file = Path(log_path) / "make-finish-stdout.log"
     )
 
-    metrics_file = os.path.join(report_path, "metrics.json")
-    metrics_command = export_command
-    metrics_command += f"{base_dir}/flow/util/genMetrics.py -x"
-    metrics_command += f" -v {flow_variant}"
-    metrics_command += f" -d {args.design}"
-    metrics_command += f" -p {args.platform}"
-    metrics_command += f" -o {metrics_file}"
+
+def run_rtl_sim(base_dir, flow_variant, files, log_path):
+    """
+    Runs the simulation and returns the path to the metrics file.
+    """
+
+    sim_report_path = base_dir / "flow" / "reports"
+    sim_file_path = files["_SIM_FILE_PATH"]
+
+    run_command(f"mkdir -p {sim_report_path}")
+    rtl_sim_command = ""
+
+    if sim_file_path.suffix == ".py":
+        rtl_sim_command += f"python {sim_file_path}"
+    elif sim_file_path.suffix == ".sh":
+        rtl_sim_command += f"{sim_file_path}"
+    elif sim_file_path.name in ["Makefile", "makefile"] or sim_file_path.suffix == ".mk":
+        rtl_sim_command += f"make -f {sim_file_path}"
+    else:
+        print(f"[ERROR TUN-xxxxx] Unsupported simulation file type: {sim_file_path.suffix}")
+
     run_command(
-        metrics_command,
-        stderr_file=f"{log_path}error-metrics.log",
-        stdout_file=f"{log_path}metrics-stdout.log",
+        rtl_sim_command,
+        stderr_file = Path(log_path) / "error-rtl_sim.log",
+        stdout_file = Path(sim_report_path) / "rtl_sim-stdout.log"
     )
 
-    return metrics_file
+    metrics_names_file = Path(sim_report_path) / "rtl_sim_metrics_names.json"
+    with open(metrics_names_file, "w") as file:
+        json.dump(METRICS_CONFIG, file, indent=2)
 
 
 def clone(path):
@@ -797,7 +862,7 @@ def setup_repo(base):
     Clone ORFS repository and compile binaries.
     """
     print(f"[INFO TUN-0000] Remote folder: {base}")
-    install = f"{base}/tools/install"
+    install = base / "tools/install"
     if args.server is not None:
         clone(base)
     build(base, install)
@@ -924,7 +989,7 @@ def parse_arguments():
     tune_parser.add_argument(
         "--eval",
         type=str,
-        choices=["default", "ppa-improv"],
+        choices=["default", "score-improv"],
         default="default",
         help="Evaluate function to use with search algorithm.",
     )
@@ -954,7 +1019,7 @@ def parse_arguments():
         type=str,
         metavar="<path>",
         default=None,
-        help="Reference file for use with PPAImprov.",
+        help="Reference file for use with ScoreImprov.",
     )
     tune_parser.add_argument(
         "--perturbation",
@@ -1013,19 +1078,25 @@ def parse_arguments():
     parser.add_argument(
         "--stage_stop",
         type=str,
-        metavar="<all, floorplan, place, cts, route...>",
+        metavar="<all, floorplan, place, cts, route, none>",
         default="all",
-        help="Stage at wchich to stop the flow and use for metrics.",
-        choices=ALLOWED_STAGES
+        help="Stage at which to stop the flow and use for metrics.",
+        choices=ALLOWED_OPENROAD_STAGES
+    )
+
+    parser.add_argument(
+        "--run_sim",
+        action="store_true",
+        help="Run a RTL or functional simulation for additional metrics.",
     )
 
     arguments = parser.parse_args()
     if arguments.mode == "tune":
         arguments.algorithm = arguments.algorithm.lower()
         # Validation of arguments
-        if arguments.eval == "ppa-improv" and arguments.reference is None:
+        if arguments.eval == "score-improv" and arguments.reference is None:
             print(
-                '[ERROR TUN-0006] The argument "--eval ppa-improv"'
+                '[ERROR TUN-0006] The argument "--eval score-improv"'
                 ' requires that "--reference <FILE>" is also given.'
             )
             sys.exit(7)
@@ -1103,7 +1174,7 @@ def set_best_params(platform, design):
     Get current known best parameters if it exists.
     """
     params = []
-    best_param_file = f"designs/{platform}/{design}/autotuner-best.json"
+    best_param_file = Path("designs") / platform / design / "autotuner-best.json"
     if os.path.isfile(best_param_file):
         with open(best_param_file) as file:
             params = json.load(file)
@@ -1116,8 +1187,8 @@ def set_training_class(function):
     """
     if function == "default":
         return AutoTunerBase
-    if function == "ppa-improv":
-        return PPAImprov
+    if function == "score-improv":
+        return ScoreImprov
     return None
 
 
@@ -1131,8 +1202,7 @@ def save_best(results):
     best_config["score_metrics_config"] = METRICS_CONFIG
     best_config["best_result"] = results.best_result[METRIC]
     trial_id = results.best_trial.trial_id
-    new_best_path = f"{BASE_LOCAL_DIR}/{args.experiment}/"
-    new_best_path += f"autotuner-best-{trial_id}.json"
+    new_best_path = BASE_LOCAL_DIR / args.experiment / f"autotuner-best-{trial_id}.json"
     with open(new_best_path, "w") as new_best_file:
         json.dump(best_config, new_best_file, indent=4)
     print(f"[INFO TUN-0003] Best parameters written to {new_best_path}")
@@ -1155,10 +1225,10 @@ def sweep():
         # For remote sweep we create the following directory structure:
         #      1/     2/         3/       4/
         # <repo>/<logs>/<platform>/<design>/
-        repo_dir = os.path.abspath(BASE_LOCAL_DIR + "/../" * 4)
+        repo_dir = (BASE_LOCAL_DIR / "../" * 4).resolve()
     else:
-        repo_dir = os.path.abspath("../")
-        log_dir = os.path.join(BASE_LOCAL_DIR, f"sweep-{DATE}")
+        repo_dir = Path("../").resolve()
+        log_dir = BASE_LOCAL_DIR / f"sweep-{DATE}"
 
     print(f"[INFO TUN-0012] Log folder {log_dir}.")
     os.makedirs(log_dir, exist_ok=True)
@@ -1208,37 +1278,32 @@ if __name__ == "__main__":
         # This allows to build required binaries once. We clone, build and
         # store intermediate files at BASE_LOCAL_DIR.
         with open(args.config) as config_file:
-            BASE_LOCAL_DIR = "/shared-data/autotuner"
-            BASE_LOCAL_DIR += f"-orfs-{args.git_orfs_branch}"
             if args.git_or_branch != "":
-                BASE_LOCAL_DIR += f"-or-{args.git_or_branch}"
+                BASE_LOCAL_DIR = f"/shared-data/autotuner-orfs-{args.git_orfs_branch}-or-{args.git_or_branch}"
             if args.git_latest:
-                BASE_LOCAL_DIR += "-or-latest"
+                BASE_LOCAL_DIR = f"/shared-data/autotuner-orfs-{args.git_orfs_branch}-or-latest"
         # Connect to ray server before first remote execution.
         ray.init(f"ray://{args.server}:{args.port}")
         # Remote functions return a task id and are non-blocking. Since we
         # need the setup repo before continuing, we call ray.get() to wait
         # for its completion.
         BASE_INSTALL_PATH = ray.get(setup_repo.remote(BASE_LOCAL_DIR))
-        BASE_LOCAL_DIR += f"/flow/logs/{args.platform}/{args.design}"
+        BASE_LOCAL_DIR = BASE_LOCAL_DIR / "/flow/logs/{args.platform}/{args.design}"
         print("[INFO TUN-0001] NFS setup completed.")
     else:
         # For local runs, use the same folder as other ORFS utilities.
-        BASE_ORFS_FLOW_DIR = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../../../flow")
-        )
+        BASE_ORFS_FLOW_DIR = Path(__file__).resolve().parents[4] / "flow"
         os.chdir(BASE_ORFS_FLOW_DIR)
-        BASE_LOCAL_DIR = f"logs/{args.platform}/{args.design}"
-        BASE_LOCAL_DIR = os.path.abspath(BASE_LOCAL_DIR)
-        BASE_INSTALL_PATH = os.path.abspath("/foss/tools")
+        BASE_LOCAL_DIR = BASE_ORFS_FLOW_DIR / "logs" / args.platform / args.design
+        BASE_INSTALL_PATH = Path("/foss/tools")
 
     if args.mode == "tune":
         best_params = set_best_params(args.platform, args.design)
         search_algo = set_algorithm(args.experiment, config_dict)
         TrainClass = set_training_class(args.eval)
-        # PPAImprov requires a reference file to compute training scores.
-        if args.eval == "ppa-improv":
-            reference = PPAImprov.read_metrics(args.reference)
+        # ScoreImprov requires a reference file to compute training scores.
+        if args.eval == "score-improv":
+            reference = ScoreImprov.read_metrics(args.reference)
 
         tune_args = dict(
             name=args.experiment,
@@ -1246,7 +1311,7 @@ if __name__ == "__main__":
             mode="min",
             num_samples=args.samples,
             fail_fast=False,
-            local_dir=BASE_LOCAL_DIR,
+            storage_path=str(BASE_LOCAL_DIR),
             resume=args.resume,
             stop={"training_iteration": args.iterations},
             resources_per_trial={"cpu": args.resources_per_trial},
