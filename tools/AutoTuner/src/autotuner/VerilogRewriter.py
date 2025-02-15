@@ -107,23 +107,25 @@ class VerilogRewriter():
         def visit_and_update(node):
             if (node.kind == pyslang.SyntaxKind.ParameterDeclaration): # Parameters
                 if node.declarators[0].name.valueText in params_left.keys():
-                    start = node.declarators[0].getLastToken().range.start.offset + self.top_char_offset_from_insertion
-                    end = node.declarators[0].getLastToken().range.end.offset + self.top_char_offset_from_insertion
+                    start = node.declarators[0].getLastToken().range.start.offset + (self.pkg_char_offset_from_insertion if is_for_pkg else self.top_char_offset_from_insertion)
+                    end = node.declarators[0].getLastToken().range.end.offset + (self.pkg_char_offset_from_insertion if is_for_pkg else self.top_char_offset_from_insertion)
+                    delta = self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.pkg_fp if is_for_pkg else self.top_fp)
                     if is_for_pkg:
-                        self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.pkg_fp)
+                        self.pkg_char_offset_from_insertion += delta
                     else:
-                        self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(params_left[node.declarators[0].name.valueText]), self.top_fp)
+                        self.top_char_offset_from_insertion += delta
                     del params_left[node.declarators[0].name.valueText]
 
             elif isinstance(node, pyslang.Token): # Defines
                 for trivia in node.trivia:
                     if trivia.kind == pyslang.TriviaKind.Directive and trivia.syntax().kind == pyslang.SyntaxKind.DefineDirective and trivia.syntax().name.valueText in defines_left.keys():
-                        start = trivia.syntax().getLastToken().range.start.offset + self.top_char_offset_from_insertion
-                        end = trivia.syntax().getLastToken().range.end.offset + self.top_char_offset_from_insertion
+                        start = trivia.syntax().getLastToken().range.start.offset + (self.pkg_char_offset_from_insertion if is_for_pkg else self.top_char_offset_from_insertion)
+                        end = trivia.syntax().getLastToken().range.end.offset + (self.pkg_char_offset_from_insertion if is_for_pkg else self.top_char_offset_from_insertion)
+                        delta = self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.pkg_fp if is_for_pkg else self.top_fp)
                         if is_for_pkg:
-                            self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.pkg_fp)
+                            self.pkg_char_offset_from_insertion += delta
                         else:
-                            self.top_char_offset_from_insertion += self._replace_in_file(start, end, str(defines_left[trivia.syntax().name.valueText]), self.top_fp)
+                            self.top_char_offset_from_insertion += delta
                         del defines_left[trivia.syntax().name.valueText]
 
             if not defines_left and not params_left:
