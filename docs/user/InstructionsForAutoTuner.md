@@ -126,7 +126,7 @@ Alternatively, here is a minimal example to get started:
 ```
 
 * `"_TOP_PARAM_coef_width"`, `"_PACKAGE_PARAM_ADDR_WIDTH"`, `"_PACKAGE_DEF_CLOCK_FREQUENCY"`, `"_PACKAGE_PARAM_DEFAULT_STATE"`, `"_SDC_CLK_PERIOD"`, `"CORE_UTILIZATION"`: Parameter names for sweeping/tuning.
-* `"type"`: Parameter type ("float", "int" or "choice") for sweeping/tuning
+* `"type"`: Parameter type ("float", "int", "power_of_2", "choice") for sweeping/tuning. Note that "power_of_2" requires both the min and max to be powers of 2 and will only generate ints.
 * `"minmax"`: Min-to-max range for sweeping/tuning. The unit follows the default value of each technology std cell library (only needed for types "float" or "int").
 * `"step"`: Parameter step within the minmax range. Step 0 for type "float" means continuous step for sweeping/tuning (only needed for types "float" or "int"). Step 0 for type "int" means the constant parameter.
 * `"values"`: List of choices (only needed for type `"choice"`).

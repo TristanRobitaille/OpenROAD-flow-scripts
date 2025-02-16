@@ -74,6 +74,7 @@ METRIC = "minimum"
 ERROR_METRIC = 9e99
 ORFS_FLOW_DIR = Path(__file__).resolve().parent / "../../../../flow"
 ORFS_FLOW_DIR = ORFS_FLOW_DIR.resolve()
+BASE_LOCAL_DIR = None
 ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all", "none"]
 FLOW_METRICS_MAP = {
     "floorplan": {  "total_power"   : ["floorplan", "power__total"],
@@ -144,7 +145,7 @@ class AutoTunerBase(tune.Trainable):
         """
         Run step experiment and compute its score.
         """
-        log_path = os.getcwd() + "/"
+        log_path = str(BASE_LOCAL_DIR / Path(args.experiment) / Path(self.variant))
         report_path = log_path.replace("logs", "reports")
         run_command(f"mkdir -p {report_path}")
         run_command(f"mkdir -p {log_path}")
@@ -346,6 +347,24 @@ def read_config(file_name):
     When min==max, it means the constant value
     """
 
+    def validate_power_of_2_range(min_val, max_val):
+        """Validates that min and max values are powers of 2"""
+        def is_power_of_2(n):
+            return n > 0 and (n & (n - 1)) == 0
+
+        if not is_power_of_2(min_val) or not is_power_of_2(max_val):
+            print(f"[ERROR TUN-00xx] When step is 'power_of_2', min ({min_val}) and max ({max_val}) must be powers of 2.")
+            sys.exit(1)
+
+    def generate_power_of_2_sequence(min_val, max_val):
+        """Generates sequence of powers of 2 between min and max inclusive"""
+        sequence = []
+        current = min_val
+        while current <= max_val:
+            sequence.append(current)
+            current *= 2
+        return sequence
+
     def apply_condition(config, data):
         # TODO: tune.sample_from only supports random search algorithm.
         # To make conditional parameter for the other algorithms, different
@@ -379,8 +398,23 @@ def read_config(file_name):
                 # Returning a choice of a single element allow pbt algorithm to
                 # work. pbt does not accept single values as tunable.
                 return tune.choice([min_, max_])
+
+            # Handle power_of_2 step
+            if isinstance(this["step"], str):
+                if this["step"] == "power_of_2":
+                    validate_power_of_2_range(min_, max_)
+                    sequence = generate_power_of_2_sequence(min_, max_)
+                    return tune.choice(sequence)
+                else:
+                    print(f"[ERROR TUN-00xx] Invalid step value '{this['step']}' for parameter '{this['name']}'.")
+                    sys.exit(1)
+
             if this["type"] == "int":
-                if this["step"] == 1:
+                if isinstance(this["step"], str) and this["step"] == "power_of_2":
+                    validate_power_of_2_range(min_, max_)
+                    sequence = generate_power_of_2_sequence(min_, max_)
+                    return tune.choice(sequence)
+                elif this["step"] == 1:
                     return tune.randint(min_, max_)
                 return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
             elif this["type"] == "float":
@@ -415,7 +449,13 @@ def read_config(file_name):
             dict_["type"] = "fixed"
             dict_["value"] = min_
         elif this["type"] == "int":
-            if this["step"] == 1:
+            if isinstance(this["step"], str) and this["step"] == "power_of_2":
+                validate_power_of_2_range(min_, max_)
+                dict_["type"] = "choice"
+                dict_["values"] = generate_power_of_2_sequence(min_, max_)
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
+            elif this["step"] == 1:
                 dict_["type"] = "range"
                 dict_["bounds"] = [min_, max_]
             else:
@@ -781,6 +821,7 @@ def openroad(base_dir, parameters, flow_variant, log_path):
     make_command += f" EQUIVALENCE_CHECK=0"
     make_command += f" NPROC={args.openroad_threads} SHELL=bash"
     run_command(f"cd {base_dir}")
+
     run_command(
         make_command,
         timeout=args.timeout,
@@ -1288,7 +1329,7 @@ if __name__ == "__main__":
         # need the setup repo before continuing, we call ray.get() to wait
         # for its completion.
         BASE_INSTALL_PATH = ray.get(setup_repo.remote(BASE_LOCAL_DIR))
-        BASE_LOCAL_DIR = BASE_LOCAL_DIR / "/flow/logs/{args.platform}/{args.design}"
+        BASE_LOCAL_DIR = BASE_LOCAL_DIR / "flow/logs/{args.platform}/{args.design}"
         print("[INFO TUN-0001] NFS setup completed.")
     else:
         # For local runs, use the same folder as other ORFS utilities.
