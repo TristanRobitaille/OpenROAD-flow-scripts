@@ -484,15 +484,15 @@ def read_config(file_name):
             print(f"[ERROR TUN-0020] Files group is missing in JSON configuration file.")
             sys.exit(1)
 
-        if "_SDC_FILE_PATH" not in json_config["files"].keys():
+        if "_SDC_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_SDC_FILE_PATH"] == "":
             print(f"[ERROR TUN-0020] SDC file (key '_SDC_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
-        if "_FR_FILE_PATH" not in json_config["files"].keys():
+        if "_FR_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_FR_FILE_PATH"] == "":
             print(f"[ERROR TUN-0020] FR file (key '_FR_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
-        if args.run_sim and "_SIM_FILE_PATH" not in json_config["files"].keys():
+        if args.run_sim and ("_SIM_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_SIM_FILE_PATH"] == ""):
             print(f"[ERROR TUN-0020] Simulation file (key '_SIM_FILE_PATH') is missing in JSON configuration file.")
             sys.exit(1)
 
