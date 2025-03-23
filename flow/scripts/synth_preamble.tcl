@@ -1,4 +1,5 @@
 yosys -import
+plugin -i slang.so
 
 source $::env(SCRIPTS_DIR)/util.tcl
 erase_non_stage_variables synth
@@ -22,31 +23,52 @@ if {[env_var_exists_and_non_empty SYNTH_NETLIST_FILES]} {
 }
 
 # Setup verilog include directories
-set vIdirsArgs ""
+set vIdirsList {}
 if {[env_var_exists_and_non_empty VERILOG_INCLUDE_DIRS]} {
-  foreach dir $::env(VERILOG_INCLUDE_DIRS) {
-    lappend vIdirsArgs "-I$dir"
+  set dirs [split $::env(VERILOG_INCLUDE_DIRS) ":"]
+  foreach dir $dirs {
+    set dir [string trim [string trim $dir "\""] " "]
+    if {$dir != ""} {
+      lappend vIdirsList $dir
+      puts "Include directory: $dir"
+    }
   }
-  set vIdirsArgs [join $vIdirsArgs]
 }
-
-
-# Read verilog files
-foreach file $::env(VERILOG_FILES) {
-  if {[file extension $file] == ".rtlil"} {
-    read_rtlil $file
-  } elseif {[file extension $file] == ".json"} {
-    read_json $file
+# Create include flags list
+set include_flags {}
+foreach dir $vIdirsList {
+  if {[file exists $dir] && [file isdirectory $dir]} {
+    lappend include_flags "--include-directory"
+    lappend include_flags $dir
   } else {
-    read_verilog -defer -sv {*}$vIdirsArgs $file
+    puts "Warning: Include directory doesn't exist: '$dir'"
   }
 }
 
-# Read standard cells and macros as blackbox inputs
-# These libs have their dont_use properties set accordingly
-read_liberty -overwrite -setattr liberty_cell -lib {*}$::env(DONT_USE_LIBS)
-read_liberty -overwrite -setattr liberty_cell \
-  -unit_delay -wb -ignore_miss_func -ignore_buses {*}$::env(DONT_USE_LIBS)
+set all_files_list "verilog_files.txt"
+set fh [open $all_files_list w]
+set rtlil_found 0
+
+# Process package files first, then regular Verilog files
+foreach file [concat $::env(PACKAGE_FILES) $::env(VERILOG_FILES)] {
+  if {[string match "*.rtlil" $file]} {
+    read_rtlil $file
+    set rtlil_found 1
+  } else {
+    puts $fh $file
+  }
+}
+
+close $fh
+
+# Read all files at once only if no RTLIL file was found
+if {!$rtlil_found} {
+  yosys read_slang {*}$include_flags --top $::env(DESIGN_NAME) \
+  --compat-mode --compat=vcs --allow-use-before-declare -f $all_files_list \
+  --unroll-limit=100000 -DSYNTHESIS --error-limit=100 -Weverything
+}
+
+file delete $all_files_list
 
 # Apply toplevel parameters (if exist)
 if {[env_var_exists_and_non_empty VERILOG_TOP_PARAMS]} {
@@ -64,16 +86,6 @@ if {[env_var_exists_and_non_empty SYNTH_BLACKBOXES]} {
   hierarchy -check -top $::env(DESIGN_NAME)
   foreach m $::env(SYNTH_BLACKBOXES) {
     blackbox $m
-  }
-}
-
-# Mark modules to keep from getting removed in flattening
-if {[env_var_exists_and_non_empty PRESERVE_CELLS]} {
-  hierarchy -check -top $::env(DESIGN_NAME)
-  foreach cell $::env(PRESERVE_CELLS) {
-    select -module $cell
-    setattr -mod -set keep_hierarchy 1
-    select -clear
   }
 }
 
