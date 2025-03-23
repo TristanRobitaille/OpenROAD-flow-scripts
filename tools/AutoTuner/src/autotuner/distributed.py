@@ -92,22 +92,22 @@ from autotuner.utils import (
     read_config,
     read_metrics,
     prepare_ray_server,
-    CONSTRAINTS_SDC,
-    FASTROUTE_TCL,
+    copy_directory,
+    ALLOWED_OPENROAD_STAGES,
+    METRICS_CONFIG,
+    DATE
 )
 
 # Name of the final metric
 METRIC = "metric"
 # The worst of optimized metric
 ERROR_METRIC = 9e99
-# Path to the FLOW_HOME directory
-ORFS_FLOW_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../../../../flow")
-)
 # URL to ORFS GitHub repository
 ORFS_URL = "https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts"
 # Global variable for args
 args = None
+sdc_original = ""
+fr_original = ""
 
 
 class AutoTunerBase(tune.Trainable):
@@ -115,7 +115,7 @@ class AutoTunerBase(tune.Trainable):
     AutoTuner base class for experiments.
     """
 
-    def setup(self, config):
+    def setup(self, config, args, json_files, sdc_original, fr_original, install_path):
         """
         Setup current experiment step.
         """
@@ -125,18 +125,28 @@ class AutoTunerBase(tune.Trainable):
         # Run by Ray in directory specified by `local_dir`
         repo_dir = os.getcwd() + "/../" * 6
         self.repo_dir = os.path.abspath(repo_dir)
+        self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
+        self.copy_dir = os.getcwd() + f"/{self.variant}"
+        self.install_path = install_path
+        self.args = args
+        copy_directory(self.repo_dir, self.copy_dir, self.args)
+
+        # Update the file paths in the configuration dictionary
+        # files = deepcopy(json_files)
+        for key, filepath in json_files.items():
+            if filepath is not None:
+                json_files[key] = self.copy_dir + f"/flow/{filepath}"
+
         self.parameters = parse_config(
+            files=json_files,
             config=config,
             base_dir=self.repo_dir,
-            platform=args.platform,
-            sdc_original=SDC_ORIGINAL,
-            constraints_sdc=CONSTRAINTS_SDC,
-            fr_original=FR_ORIGINAL,
-            fastroute_tcl=FASTROUTE_TCL,
+            platform=self.args.platform,
+            sdc_original=sdc_original,
+            fr_original=fr_original,
             path=os.getcwd(),
         )
         self.step_ = 0
-        self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
         # Do a valid config check here, since we still have the config in a
         # dict vs. having to scan through the parameter string later
         self.is_valid_config = self._is_valid_config(config)
@@ -151,11 +161,11 @@ class AutoTunerBase(tune.Trainable):
             return {METRIC: ERROR_METRIC, "effective_clk_period": "-", "num_drc": "-"}
         self._variant = f"{self.variant}-{self.step_}"
         metrics_file = openroad(
-            args=args,
+            args=self.args,
             base_dir=self.repo_dir,
             parameters=self.parameters,
             flow_variant=self._variant,
-            install_path=INSTALL_PATH,
+            install_path=self.install_path,
         )
         self.step_ += 1
         (score, effective_clk_period, num_drc) = self.evaluate(
@@ -312,10 +322,7 @@ def parse_arguments():
         help="Time limit (in hours) for each trial run. Default is no limit.",
     )
     tune_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume previous run. Note that you must also set a unique experiment\
-                name identifier via `--experiment NAME` to be able to resume.",
+        "--resume", action="store_true", help="Resume previous run."
     )
 
     # Setup
@@ -323,14 +330,14 @@ def parse_arguments():
         "--git_clean",
         action="store_true",
         help="Clean binaries and build files."
-        " WARNING: may lose previous data."
+        f"WARNING: may lose previous data."
         " Use carefully.",
     )
     parser.add_argument(
         "--git_clone",
         action="store_true",
         help="Force new git clone."
-        " WARNING: may lose previous data."
+        f"WARNING: may lose previous data."
         " Use carefully.",
     )
     parser.add_argument(
@@ -383,7 +390,7 @@ def parse_arguments():
     tune_parser.add_argument(
         "--eval",
         type=str,
-        choices=["default", "ppa-improv"],
+        choices=["default", "score-improv"],
         default="default",
         help="Evaluate function to use with search algorithm.",
     )
@@ -403,8 +410,8 @@ def parse_arguments():
     )
     tune_parser.add_argument(
         "--resources_per_trial",
-        type=float,
-        metavar="<float>",
+        type=int,
+        metavar="<int>",
         default=1,
         help="Number of CPUs to request for each tuning job.",
     )
@@ -413,7 +420,7 @@ def parse_arguments():
         type=str,
         metavar="<path>",
         default=None,
-        help="Reference file for use with PPAImprov.",
+        help="Reference file for use with ScoreImprov.",
     )
     tune_parser.add_argument(
         "--perturbation",
@@ -469,36 +476,41 @@ def parse_arguments():
         " training stderr\n\t2: also print training stdout.",
     )
 
-    args = parser.parse_args()
-    if args.mode == "tune":
-        args.algorithm = args.algorithm.lower()
+    parser.add_argument(
+        "--stage_stop",
+        type=str,
+        metavar="<all, floorplan, place, cts, route, none>",
+        default="all",
+        help="Stage at which to stop the flow and use for metrics.",
+        choices=ALLOWED_OPENROAD_STAGES
+    )
+
+    parser.add_argument(
+        "--run_sim",
+        action="store_true",
+        help="Run a RTL or functional simulation for additional metrics.",
+    )
+
+    arguments = parser.parse_args()
+    if arguments.mode == "tune":
+        arguments.algorithm = arguments.algorithm.lower()
         # Validation of arguments
-        if args.eval == "ppa-improv" and args.reference is None:
+        if arguments.eval == "score-improv" and arguments.reference is None:
             print(
-                '[ERROR TUN-0006] The argument "--eval ppa-improv"'
+                '[ERROR TUN-0006] The argument "--eval score-improv"'
                 ' requires that "--reference <FILE>" is also given.'
             )
             sys.exit(7)
 
-        # Check for experiment name and resume flag.
-        if args.resume and args.experiment == "test":
-            print(
-                '[ERROR TUN-0031] The flag "--resume"'
-                ' requires that "--experiment NAME" is also given.'
-            )
-            sys.exit(1)
+    arguments.experiment += f"-{arguments.mode}-{DATE}"
 
-    # If the experiment name is the default, add a UUID to the end.
-    if args.experiment == "test":
-        id = str(uuid())[:8]
-        args.experiment = f"{args.mode}-{id}"
-    else:
-        args.experiment += f"-{args.mode}"
+    if arguments.timeout is not None:
+        arguments.timeout = round(arguments.timeout * 3600)
 
-    if args.timeout is not None:
-        args.timeout = round(args.timeout * 3600)
+    if (arguments.mode == "tune") and (arguments.eval == "default") and (arguments.stage_stop in ["floorplan", "place", "cts"]):
+        print(f"Score for evaluation method 'default' with stage stop `{arguments.stage_stop}` will not consider DRC errors (only available after routing).")
 
-    return args
+    return arguments
 
 
 def set_algorithm(
@@ -598,7 +610,7 @@ def save_best(results):
     print(f"[INFO TUN-0003] Best parameters written to {new_best_path}")
 
 
-def sweep():
+def sweep(orfs_flow_dir, args, sdc_original, fr_original, install_path):
     """Run sweep of parameters"""
     if args.server is not None:
         # For remote sweep we create the following directory structure:
@@ -606,7 +618,7 @@ def sweep():
         # <repo>/<logs>/<platform>/<design>/
         repo_dir = os.path.abspath(LOCAL_DIR + "/../" * 4)
     else:
-        repo_dir = os.path.abspath(os.path.join(ORFS_FLOW_DIR, ".."))
+        repo_dir = os.path.abspath(os.path.join(orfs_flow_dir, ".."))
     print(f"[INFO TUN-0012] Log folder {LOCAL_DIR}.")
     queue = Queue()
     parameter_list = list()
@@ -624,7 +636,7 @@ def sweep():
         for value in parameter:
             temp.update(value)
         queue.put(
-            [args, repo_dir, temp, LOCAL_DIR, SDC_ORIGINAL, FR_ORIGINAL, INSTALL_PATH]
+            [args, repo_dir, temp, LOCAL_DIR, sdc_original, fr_original, install_path]
         )
     workers = [consumer.remote(queue) for _ in range(args.jobs)]
     print("[INFO TUN-0009] Waiting for results.")
@@ -633,16 +645,13 @@ def sweep():
 
 
 def main():
-    global args, SDC_ORIGINAL, FR_ORIGINAL, LOCAL_DIR, INSTALL_PATH, ORFS_FLOW_DIR, config_dict, reference, best_params
+    global args, sdc_original, fr_original, LOCAL_DIR, config_dict, reference, best_params
     args = parse_arguments()
 
     # Read config and original files before handling where to run in case we
     # need to upload the files.
-    config_dict, SDC_ORIGINAL, FR_ORIGINAL = read_config(
-        os.path.abspath(args.config), args.mode, getattr(args, "algorithm", None)
-    )
-
-    LOCAL_DIR, ORFS_FLOW_DIR, INSTALL_PATH = prepare_ray_server(args)
+    LOCAL_DIR, ORFS_FLOW_DIR, install_path = prepare_ray_server(args)
+    config_dict, json_files, sdc_original, fr_original = read_config(args, ORFS_FLOW_DIR)
 
     if args.mode == "tune":
         best_params = set_best_params(args.platform, args.design)
@@ -670,7 +679,7 @@ def main():
             resume=args.resume,
             stop={"training_iteration": args.iterations},
             resources_per_trial={"cpu": os.cpu_count() / args.jobs},
-            log_to_file=["trail-out.log", "trail-err.log"],
+            log_to_file=["trial-out.log", "trial-err.log"],
             trial_name_creator=lambda x: f"variant-{x.trainable_name}-{x.trial_id}-ray",
             trial_dirname_creator=lambda x: f"variant-{x.trainable_name}-{x.trial_id}-ray",
         )
@@ -682,7 +691,13 @@ def main():
             tune_args["scheduler"] = AsyncHyperBandScheduler()
         if args.algorithm != "ax":
             tune_args["config"] = config_dict
-        analysis = tune.run(TrainClass, **tune_args)
+        # analysis = tune.run(TrainClass, **tune_args)
+        analysis = tune.run(tune.with_parameters(TrainClass, 
+                                                 args=args,
+                                                 json_files=json_files,
+                                                 sdc_original=sdc_original,
+                                                 fr_original=fr_original,
+                                                 install_path=install_path), **tune_args)
 
         task_id = save_best.remote(analysis)
         _ = ray.get(task_id)
@@ -693,7 +708,7 @@ def main():
             print("[ERROR TUN-0016] No successful runs found.")
             sys.exit(1)
     elif args.mode == "sweep":
-        sweep()
+        sweep(ORFS_FLOW_DIR, sdc_original, fr_original, install_path)
 
 
 if __name__ == "__main__":

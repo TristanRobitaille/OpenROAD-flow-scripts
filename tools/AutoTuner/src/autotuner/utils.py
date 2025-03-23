@@ -44,9 +44,12 @@ from multiprocessing import cpu_count
 from datetime import datetime
 from uuid import uuid4 as uuid
 from time import time
+from copy import deepcopy
+from shutil import copytree, ignore_patterns
 
 import numpy as np
 import ray
+from ray import tune
 
 # Default scheme of a SDC constraints file
 SDC_TEMPLATE = """
@@ -64,17 +67,28 @@ set non_clock_inputs [lsearch -inline -all -not -exact [all_inputs] $clk_port]
 set_input_delay  [expr $clk_period * $clk_io_pct] -clock $clk_name $non_clock_inputs
 set_output_delay [expr $clk_period * $clk_io_pct] -clock $clk_name [all_outputs]
 """
-# Name of the SDC file with constraints
-CONSTRAINTS_SDC = "constraint.sdc"
-# Name of the TCL script run before routing
-FASTROUTE_TCL = "fastroute.tcl"
+
+JSON_FILEPATHS = { # Base path for files
+    "_SDC_FILE_PATH": None,
+    "_FR_FILE_PATH": None,
+    "_PACKAGE_FILE_PATH": None,
+    "_TOP_LEVEL_FILE_PATH": None,
+    "_SIM_FILE_PATH": None
+}
+# Path to the FLOW_HOME directory
+ORFS_FLOW_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../../../flow")
+)
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+ALLOWED_OPENROAD_STAGES = ["floorplan", "place", "cts", "route", "all", "none"]
+METRICS_CONFIG = dict() # Configuration for the metrics used to compute the score for each run
 
 
-def write_sdc(variables, path, sdc_original, constraints_sdc):
+def write_sdc(variables, sdc_original, filepath):
     """
     Create a SDC file with parameters for current tuning iteration.
     """
+
     # Handle case where the reference file does not exist
     if sdc_original == "":
         print("[ERROR TUN-0020] No SDC reference file provided.")
@@ -112,13 +126,12 @@ def write_sdc(variables, path, sdc_original, constraints_sdc):
                 f"[WARN TUN-0025] {key} variable not supported in context of SDC files"
             )
             continue
-    file_name = path + f"/{constraints_sdc}"
-    with open(file_name, "w") as file:
+
+    with open(filepath, "w") as file:
         file.write(new_file)
-    return file_name
 
 
-def write_fast_route(variables, path, platform, fr_original, fastroute_tcl):
+def write_fast_route(variables, platform, fr_original, filepath):
     """
     Create a FastRoute Tcl file with parameters for current tuning iteration.
     """
@@ -154,10 +167,9 @@ def write_fast_route(variables, path, platform, fr_original, fastroute_tcl):
                 f"[WARN TUN-0028] {key} variable not supported in context of FastRoute TCL files"
             )
             continue
-    file_name = path + f"/{fastroute_tcl}"
-    with open(file_name, "w") as file:
+
+    with open(filepath, "w") as file:
         file.write(new_file)
-    return file_name
 
 
 def parse_flow_variables(base_dir, platform):
@@ -213,13 +225,12 @@ def parse_tunable_variables():
 
 
 def parse_config(
+    files,
     config,
     base_dir,
     platform,
     sdc_original,
-    constraints_sdc,
     fr_original,
-    fastroute_tcl,
     path=os.getcwd(),
 ):
     """
@@ -254,11 +265,11 @@ def parse_config(
                 sys.exit(1)
             options += f" {key}={value}"
     if sdc:
-        write_sdc(sdc, path, sdc_original, constraints_sdc)
-        options += f" SDC_FILE={path}/{constraints_sdc}"
+        write_sdc(sdc, sdc_original, files["_SDC_FILE_PATH"])
+        options += f" SDC_FILE={files['_SDC_FILE_PATH']}"
     if fast_route:
-        write_fast_route(fast_route, path, platform, fr_original, fastroute_tcl)
-        options += f" FASTROUTE_TCL={path}/{fastroute_tcl}"
+        write_fast_route(fast_route, platform, fr_original, files["_FR_FILE_PATH"])
+        options += f" FASTROUTE_TCL={files['_FR_FILE_PATH']}"
     return options
 
 
@@ -316,12 +327,20 @@ def openroad(
     export_command += " && "
 
     make_command = export_command
-    make_command += f"make -C {base_dir}/flow DESIGN_CONFIG=designs/"
+    make_command += f"make"
+    if args.stage_stop != "all":
+        for i in range (ALLOWED_OPENROAD_STAGES.index(args.stage_stop) + 1):
+            make_command += f" {ALLOWED_OPENROAD_STAGES[i]}" # Append preceding flow stages to make command
+    make_command += f" -C {base_dir}/flow DESIGN_CONFIG=designs/"
     make_command += f"{args.platform}/{args.design}/config.mk"
     make_command += f" PLATFORM={args.platform}"
-    make_command += f" FLOW_VARIANT={flow_variant} {parameters}"
-    make_command += " EQUIVALENCE_CHECK=0"
+    make_command += f" FLOW_VARIANT={args.experiment}/{flow_variant} {parameters}"
+    make_command += f" EQUIVALENCE_CHECK=0"
     make_command += f" NUM_CORES={args.openroad_threads} SHELL=bash"
+    run_command(args, f"cd {base_dir}")
+
+    print(f"TR make_command: {make_command}")
+
     run_command(
         args,
         make_command,
@@ -399,7 +418,7 @@ def read_metrics(file_name):
     return ret
 
 
-def read_config(file_name, mode, algorithm):
+def read_config(args, orfs_flow_dir):
     """
     Please consider inclusive, exclusive
     Most type uses [min, max)
@@ -409,26 +428,31 @@ def read_config(file_name, mode, algorithm):
     When min==max, it means the constant value
     """
 
-    def read(path):
-        # if file path does not exist, return empty string
-        print(os.path.abspath(path))
-        if not os.path.isfile(os.path.abspath(path)):
-            return ""
-        with open(os.path.abspath(path), "r") as file:
-            ret = file.read()
-        return ret
+    file_name = os.path.abspath(args.config)
 
-    def read_sweep(this):
-        return [*this["minmax"], this["step"]]
+    def validate_power_of_2_range(min_val, max_val):
+        """Validates that min and max values are powers of 2"""
+        def is_power_of_2(n):
+            return n > 0 and (n & (n - 1)) == 0
+
+        if not is_power_of_2(min_val) or not is_power_of_2(max_val):
+            print(f"[ERROR TUN-00xx] When step is 'power_of_2', min ({min_val}) and max ({max_val}) must be powers of 2.") # TODO: Add parameter name to error message
+            sys.exit(1)
+
+    def generate_power_of_2_sequence(min_val, max_val):
+        """Generates sequence of powers of 2 between min and max inclusive"""
+        sequence = []
+        current = min_val
+        while current <= max_val:
+            sequence.append(current)
+            current *= 2
+        return sequence
 
     def apply_condition(config, data):
-        from ray import tune
-        import random
-
         # TODO: tune.sample_from only supports random search algorithm.
         # To make conditional parameter for the other algorithms, different
         # algorithms should take different methods (will be added)
-        if algorithm != "random":
+        if args.algorithm != "random":
             return config
         dp_pad_min = data["CELL_PAD_IN_SITES_DETAIL_PLACEMENT"]["minmax"][0]
         dp_pad_step = data["CELL_PAD_IN_SITES_DETAIL_PLACEMENT"]["step"]
@@ -448,31 +472,68 @@ def read_config(file_name, mode, algorithm):
             )
         return config
 
-    def read_tune(this):
-        from ray import tune
+    def read(path):
+        # if file path does not exist, return empty string
+        print(os.path.abspath(path))
+        if not os.path.isfile(os.path.abspath(path)):
+            return ""
+        with open(os.path.abspath(path), "r") as file:
+            ret = file.read()
+        return ret
 
-        min_, max_ = this["minmax"]
-        if min_ == max_:
-            # Returning a choice of a single element allow pbt algorithm to
-            # work. pbt does not accept single values as tunable.
-            return tune.choice([min_, max_])
-        if this["type"] == "int":
-            if this["step"] == 1:
-                return tune.randint(min_, max_)
-            return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
-        if this["type"] == "float":
-            if this["step"] == 0:
-                return tune.uniform(min_, max_)
-            return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
+    def read_tune(this):
+        if this["type"] == "choice":
+            return tune.choice(this["values"])
+        else:
+            min_, max_ = this["minmax"]
+            if min_ == max_:
+                # Returning a choice of a single element allow pbt algorithm to
+                # work. pbt does not accept single values as tunable.
+                return tune.choice([min_, max_])
+
+            # Handle power_of_2 step
+            if isinstance(this["step"], str):
+                if this["step"] == "power_of_2":
+                    validate_power_of_2_range(min_, max_)
+                    sequence = generate_power_of_2_sequence(min_, max_)
+                    return tune.choice(sequence)
+                else:
+                    print(f"[ERROR TUN-00xx] Invalid step value '{this['step']}.") # TODO: Add parameter name to error message
+                    sys.exit(1)
+
+            if this["type"] == "int":
+                if isinstance(this["step"], str) and this["step"] == "power_of_2":
+                    validate_power_of_2_range(min_, max_)
+                    sequence = generate_power_of_2_sequence(min_, max_)
+                    return tune.choice(sequence)
+                elif this["step"] == 1:
+                    return tune.randint(min_, max_)
+                return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
+            elif this["type"] == "float":
+                if this["step"] == 0:
+                    return tune.uniform(min_, max_)
+                return tune.choice(np.ndarray.tolist(np.arange(min_, max_, this["step"])))
         return None
 
     def read_tune_ax(name, this):
         """
         Ax format: https://ax.dev/versions/0.3.7/api/service.html
         """
-        from ray import tune
-
         dict_ = dict(name=name)
+
+        if this["type"] == "choice":
+            dict_["type"] = "choice"
+            dict_["values"] = this["values"]
+            dict_["is_ordered"] = False
+            dict_["sort_values"] = False
+            if isinstance(this["values"][0], str):
+                dict_["value_type"] = "str"
+            elif isinstance(this["values"][0], int):
+                dict_["value_type"] = "int"
+            elif isinstance(this["values"][0], float):
+                dict_["value_type"] = "float"
+            return dict_
+
         if "minmax" not in this:
             return None
         min_, max_ = this["minmax"]
@@ -480,43 +541,152 @@ def read_config(file_name, mode, algorithm):
             dict_["type"] = "fixed"
             dict_["value"] = min_
         elif this["type"] == "int":
-            if this["step"] == 1:
+            if isinstance(this["step"], str) and this["step"] == "power_of_2":
+                validate_power_of_2_range(min_, max_)
+                dict_["type"] = "choice"
+                dict_["values"] = generate_power_of_2_sequence(min_, max_)
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
+            elif this["step"] == 1:
                 dict_["type"] = "range"
                 dict_["bounds"] = [min_, max_]
-                dict_["value_type"] = "int"
             else:
                 dict_["type"] = "choice"
-                dict_["values"] = tune.randint(min_, max_, this["step"])
-                dict_["value_type"] = "int"
+                dict_["values"] = np.arange(min_, max_, this["step"]).tolist()
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
+            dict_["value_type"] = "int"
         elif this["type"] == "float":
             if this["step"] == 1:
                 dict_["type"] = "choice"
-                dict_["values"] = tune.choice(
-                    np.ndarray.tolist(np.arange(min_, max_, this["step"]))
-                )
-                dict_["value_type"] = "float"
+                dict_["values"] = np.arange(min_, max_, this["step"]).tolist()
+                dict_["is_ordered"] = True
+                dict_["sort_values"] = False
             else:
                 dict_["type"] = "range"
                 dict_["bounds"] = [min_, max_]
-                dict_["value_type"] = "float"
+            dict_["value_type"] = "float"
         return dict_
 
-    def read_tune_pbt(name, this):
+    def parse_filepaths(json_config):
         """
-        PBT format: https://docs.ray.io/en/releases-2.9.3/tune/examples/pbt_guide.html
-        Note that PBT does not support step values.
+        Parse file paths from JSON configuration file.
         """
-        from ray import tune
+        if "files" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Files group is missing in JSON configuration file.")
+            sys.exit(1)
 
-        if "minmax" not in this:
-            return None
-        min_, max_ = this["minmax"]
-        if min_ == max_:
-            return tune.choice([min_, max_])
-        if this["type"] == "int":
-            return tune.randint(min_, max_)
-        if this["type"] == "float":
-            return tune.uniform(min_, max_)
+        if "_SDC_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_SDC_FILE_PATH"] == "":
+            print(f"[ERROR TUN-0020] SDC file (key '_SDC_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if "_FR_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_FR_FILE_PATH"] == "":
+            print(f"[ERROR TUN-0020] FR file (key '_FR_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if args.run_sim and ("_SIM_FILE_PATH" not in json_config["files"].keys() or json_config["files"]["_SIM_FILE_PATH"] == ""):
+            print(f"[ERROR TUN-0020] Simulation file (key '_SIM_FILE_PATH') is missing in JSON configuration file.")
+            sys.exit(1)
+
+        sdc_file = ""
+        fr_file = ""
+        for key, filepath in json_config["files"].items():
+            if "_FILE_PATH" not in key:
+                print(f"[WARNING TUN-xxx] Field {key} isn't valid for group 'files'. Ignoring it.")
+                continue
+
+            if key in JSON_FILEPATHS.keys() and JSON_FILEPATHS[key] is not None:
+                print(f"[WARNING TUN-0004] Obtained more than one file path for {key}.")
+
+            if filepath == "":
+                print(f"[WARNING TUN-xxx] Value for key {key} in the 'files' group is blank. Ignoring it.")
+                continue
+
+            full_path = os.path.join(os.path.dirname(file_name), filepath)
+            JSON_FILEPATHS[key] = str(full_path).partition("flow/")[2]
+
+            if key == "_SDC_FILE_PATH":
+                if sdc_file != "":
+                    print("[WARNING TUN-0004] Overwriting SDC base file.")
+                sdc_file = read(orfs_flow_dir + f"/{JSON_FILEPATHS['_SDC_FILE_PATH']}")
+            elif key == "_FR_FILE_PATH":
+                if fr_file != "":
+                    print("[WARNING TUN-0005] Overwriting FastRoute base file.")
+                fr_file = read(orfs_flow_dir + f"/{JSON_FILEPATHS['_FR_FILE_PATH']}")
+
+        return sdc_file, fr_file
+
+    def parse_metrics(json_config):
+        """
+        Parse metrics from JSON configuration file.
+        """
+        if "score_metrics" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Metrics group is missing in JSON configuration file.")
+            sys.exit(1)
+
+        for metric_name, metric_config in json_config["score_metrics"].items():
+            if metric_config is None:
+                print(f"[WARNING TUN-0005] Metric {metric_name} has no configuration. Ignoring it.")
+                continue
+            METRICS_CONFIG[metric_name] = metric_config
+
+    def parse_parameters(json_config):
+        """
+        Parse parameters from JSON configuration file.
+        """
+
+        if "parameters" not in json_config.keys():
+            print(f"[ERROR TUN-0020] Parameters group is missing in JSON configuration file.")
+            sys.exit(1)
+
+        if args.mode == "tune" and args.algorithm == "ax":
+            config = list()
+        else:
+            config = dict()
+
+        top_param_or_def_found, package_param_or_def_found = False, False
+        for key, value in json_config["parameters"].items():
+            if key == "best_result":
+                continue
+
+            # If we're not running any OpenROAD stage, ignore all non-RTL parameters
+            if args.stage_stop == "none" and not (key.startswith("_TOP") or key.startswith("_PACKAGE")):
+                continue
+
+            top_param_or_def_found = ("_TOP_PARAM" in key) or top_param_or_def_found
+            package_param_or_def_found = ("_PACKAGE" in key) or package_param_or_def_found
+
+            if not isinstance(value, dict):
+                if args.mode == "tune" and args.algorithm == "ax":
+                    param_dict = read_tune_ax(key, value)
+                    if param_dict:
+                        config.append(param_dict)
+                elif args.mode == "tune" and args.algorithm == "pbt":
+                    param_dict = read_tune(value)
+                    if param_dict:
+                        config[key] = param_dict
+                else:
+                    config[key] = value
+            elif args.mode == "sweep":
+                config[key] = value
+            elif args.mode == "tune" and args.algorithm == "ax":
+                config.append(read_tune_ax(key, value))
+            elif args.mode == "tune" and args.algorithm == "pbt":
+                config[key] = read_tune(value)
+            elif args.mode == "tune":
+                config[key] = read_tune(value)
+
+        if args.mode == "tune":
+            config = apply_condition(config, json_config["parameters"])
+
+        if top_param_or_def_found and JSON_FILEPATHS["_TOP_LEVEL_FILE_PATH"] == None:
+            print(f"[ERROR TUN-0020] _TOP_PARAM_ or _TOP_DEF_ found in JSON configuration file but _TOP_LEVEL_FILE_PATH is missing.")
+            sys.exit(1)
+        if package_param_or_def_found and JSON_FILEPATHS["_PACKAGE_FILE_PATH"] == None:
+            print(f"[ERROR TUN-0020] _PACKAGE_PARAM_ or _PACKAGE_DEF_ found in JSON configuration file but _PACKAGE_FILE_PATH is missing.")
+            sys.exit(1)
+
+        return config
 
     # Check file exists and whether it is a valid JSON file.
     assert os.path.isfile(file_name), f"File {file_name} not found."
@@ -525,48 +695,12 @@ def read_config(file_name, mode, algorithm):
             data = json.load(file)
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON file: {file_name}")
-    sdc_file = ""
-    fr_file = ""
-    if mode == "tune" and algorithm == "ax":
-        config = list()
-    else:
-        config = dict()
-    for key, value in data.items():
-        if key == "best_result":
-            continue
-        if key == "_SDC_FILE_PATH" and value != "":
-            if sdc_file != "":
-                print("[WARNING TUN-0004] Overwriting SDC base file.")
-            sdc_file = read(f"{os.path.dirname(file_name)}/{value}")
-            continue
-        if key == "_FR_FILE_PATH" and value != "":
-            if fr_file != "":
-                print("[WARNING TUN-0005] Overwriting FastRoute base file.")
-            fr_file = read(f"{os.path.dirname(file_name)}/{value}")
-            continue
-        if not isinstance(value, dict):
-            # To take care of empty values like _FR_FILE_PATH
-            if mode == "tune" and algorithm == "ax":
-                param_dict = read_tune_ax(key, value)
-                if param_dict:
-                    config.append(param_dict)
-            elif mode == "tune" and algorithm == "pbt":
-                param_dict = read_tune_pbt(key, value)
-                if param_dict:
-                    config[key] = param_dict
-            else:
-                config[key] = value
-        elif mode == "sweep":
-            config[key] = read_sweep(value)
-        elif mode == "tune" and algorithm == "ax":
-            config.append(read_tune_ax(key, value))
-        elif mode == "tune" and algorithm == "pbt":
-            config[key] = read_tune_pbt(key, value)
-        elif mode == "tune":
-            config[key] = read_tune(value)
-    if mode == "tune":
-        config = apply_condition(config, data)
-    return config, sdc_file, fr_file
+
+    sdc_original, fr_original = parse_filepaths(data)
+    parse_metrics(data)
+    config = parse_parameters(data)
+
+    return config, JSON_FILEPATHS, sdc_original, fr_original
 
 
 def clone(args, path):
@@ -605,6 +739,23 @@ def build(args, base, install):
     run_command(args, build_command)
 
 
+def copy_directory(repo_dir, copy_dir, args):
+    """
+    Makes a local copy of the repo, but discards unnecessary directories (unused platforms and designs, etc).
+    This gives each run a fresh copy of the design file to avoid race conditions.
+    """
+
+    dont_copy = ["logs", "reports", "results", "objects", "docs", "autotuner_env"]
+    for pattern, directory in [(args.platform, "platforms"), (args.platform, "designs"), (args.design, "designs/src")]:
+        target_dir = ORFS_FLOW_DIR + f"/{directory}"
+        all_patterns = [d for d in os.listdir(target_dir)
+                        if os.path.isdir(os.path.join(target_dir, d))]
+        other_patterns = [p for p in all_patterns if (p != pattern and p != "src" and p != "common")]
+        dont_copy.extend(other_patterns)
+
+    copytree(str(repo_dir), str(copy_dir), ignore=ignore_patterns(*dont_copy))
+
+
 @ray.remote
 def setup_repo(args, base):
     """
@@ -621,6 +772,7 @@ def setup_repo(args, base):
 def prepare_ray_server(args):
     """
     Prepares Ray server and returns basic directories.
+    # TR TODO: Handle ORFS_FLOW_DIR (comes from global in utils.py (and imported in distributed.py or returned from here?))
     """
     # Connect to remote Ray server if any, otherwise will run locally
     if args.server is not None:
@@ -651,9 +803,11 @@ def prepare_ray_server(args):
             if orfs_dir
             else os.path.join(os.path.dirname(__file__), "../../../../flow")
         )
+        
         local_dir = f"logs/{args.platform}/{args.design}"
         local_dir = os.path.join(orfs_flow_dir, local_dir)
         install_path = os.path.abspath(os.path.join(orfs_flow_dir, "../tools/install"))
+        install_path = os.path.abspath("foss/tools") # TODO: TR OVERRIDE for oseda...think about what to do about this
     return local_dir, orfs_flow_dir, install_path
 
 
@@ -670,13 +824,12 @@ def openroad_distributed(
 ):
     """Simple wrapper to run openroad distributed with Ray."""
     config = parse_config(
+        copy_dir,
         config=config,
         base_dir=repo_dir,
         platform=args.platform,
         sdc_original=sdc_original,
-        constraints_sdc=CONSTRAINTS_SDC,
         fr_original=fr_original,
-        fastroute_tcl=FASTROUTE_TCL,
     )
     if variant is None:
         variant = config.replace(" ", "_").replace("=", "_")
